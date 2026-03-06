@@ -11,13 +11,13 @@ Expects a pre-trained generator checkpoint from reconstruction-only training (tr
 
 Usage:
     # Single GPU
-    python finetuning/decoder_block_48k/train_gan.py \
+    python trainer.py \
         --train_shards "data/train-{000000..000010}.tar" \
         --resume_generator_from output/decoder_block_48k/run1/checkpoint-best \
         --output_dir output/decoder_block_48k/run_gan1
 
     # Multi-GPU (accelerate)
-    accelerate launch finetuning/decoder_block_48k/train_gan.py \
+    accelerate launch trainer.py \
         --train_shards "data/train-*.tar" \
         --resume_generator_from output/decoder_block_48k/run1/checkpoint-best \
         --output_dir output/decoder_block_48k/run_gan1
@@ -75,6 +75,51 @@ from qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
 from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Decoder,
 )
+
+BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
+
+
+def expand_shards(path: str, print_fn=print) -> "str | list[str]":
+    """Expand glob wildcards to a sorted file list, or return the path unchanged."""
+    if "*" in path and "{" not in path:
+        expanded = sorted(glob.glob(path))
+        if not expanded:
+            print_fn(f"Error: No files found matching pattern: {path}")
+            sys.exit(1)
+        print_fn(f"Found {len(expanded)} tar files")
+        return expanded
+    return path
+
+
+def align_audio(
+    pred_48k: torch.Tensor, target_48k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Squeeze channel dim if present and truncate both tensors to the same length."""
+    pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
+    target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
+    min_len = min(pred.shape[-1], target.shape[-1])
+    return pred[..., :min_len], target[..., :min_len], min_len
+
+
+def apply_length_mask(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    lengths: torch.Tensor,
+    min_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-out padding regions beyond each sample's valid length."""
+    mask = torch.arange(min_len, device=pred.device)[None, :] < lengths[:, None]
+    return pred * mask, target * mask
+
+
+def compute_grad_norm(module: nn.Module) -> float:
+    """Compute L2 gradient norm across all parameters with gradients."""
+    return (
+        sum(
+            p.grad.norm().item() ** 2 for p in module.parameters() if p.grad is not None
+        )
+        ** 0.5
+    )
 
 
 def parse_args():
@@ -456,17 +501,9 @@ def eval_step(
 
         pred_48k = model(audio_codes)
 
-        # Align shapes
-        pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
-        target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
-        min_len = min(pred.shape[-1], target.shape[-1])
-        pred = pred[..., :min_len]
-        target = target[..., :min_len]
-
-        # Mask padding region
-        mask = torch.arange(min_len, device=pred.device)[None, :] < lengths_48k[:, None]
-        pred = pred * mask
-        target = target * mask
+        # Align shapes and mask padding
+        pred, target, min_len = align_audio(pred_48k, target_48k)
+        pred, target = apply_length_mask(pred, target, lengths_48k, min_len)
 
         mel_loss = mel_loss_fn(pred, target)
         total_mel_loss += mel_loss.item()
@@ -506,11 +543,15 @@ def save_checkpoint(
     unwrapped_model = accelerator.unwrap_model(model)
     decoder = unwrapped_model.decoder
     trainable_state_dict = {}
-    for i in range(num_frozen, len(decoder.decoder)):
-        prefix = f"decoder.{i}."
-        for k, v in decoder.state_dict().items():
-            if k.startswith(prefix):
-                trainable_state_dict[k] = v.cpu()
+    for k, v in decoder.state_dict().items():
+        parts = k.split(".", 2)
+        if (
+            parts[0] == "decoder"
+            and len(parts) > 1
+            and parts[1].isdigit()
+            and int(parts[1]) >= num_frozen
+        ):
+            trainable_state_dict[k] = v.cpu()
     save_file(trainable_state_dict, str(checkpoint_dir / "decoder_block.safetensors"))
 
     # Discriminator weights
@@ -584,7 +625,7 @@ def main():
     mpd, msd = create_discriminators(accelerator)
 
     # Mel loss (reconstruction component)
-    target_sample_rate = 24000 * args.extra_upsample_rate
+    target_sample_rate = BASE_SAMPLE_RATE * args.extra_upsample_rate
     gan_crop_samples = (
         int(args.gan_crop_seconds * target_sample_rate)
         if args.gan_crop_seconds > 0
@@ -596,16 +637,7 @@ def main():
 
     # Training data
     accelerator.print(f"Loading training data: {args.train_shards}...")
-    path = args.train_shards
-    if "*" in path and "{" not in path:
-        expanded_files = sorted(glob.glob(path))
-        if not expanded_files:
-            print(f"Error: No files found matching pattern: {path}")
-            sys.exit(1)
-        print(f"Found {len(expanded_files)} tar files")
-        shard_pattern = expanded_files
-    else:
-        shard_pattern = path
+    shard_pattern = expand_shards(args.train_shards, accelerator.print)
 
     train_dataloader = create_webdataset_loader(
         shard_pattern=shard_pattern,
@@ -620,16 +652,7 @@ def main():
     # Validation data (optional)
     val_dataloader = None
     if args.val_shards:
-        path = args.val_shards
-        if "*" in path and "{" not in path:
-            expanded_files = sorted(glob.glob(path))
-            if not expanded_files:
-                print(f"Error: No files found matching pattern: {path}")
-                sys.exit(1)
-            print(f"Found {len(expanded_files)} tar files")
-            shard_pattern = expanded_files
-        else:
-            shard_pattern = path
+        shard_pattern = expand_shards(args.val_shards, accelerator.print)
 
         val_dataloader = create_webdataset_loader(
             shard_pattern=shard_pattern,
@@ -688,6 +711,10 @@ def main():
     msd = accelerator.prepare(msd)
     if val_dataloader:
         val_dataloader = accelerator.prepare(val_dataloader)
+
+    # Cache discriminator params and dtype (used repeatedly in training loop)
+    disc_params = list(mpd.parameters()) + list(msd.parameters())
+    disc_dtype = next(mpd.parameters()).dtype
 
     # Initialize tracker
     if args.log_with and accelerator.is_main_process:
@@ -809,11 +836,7 @@ def main():
             pred_48k = model(audio_codes)
 
             # Align shapes for loss computation
-            pred = pred_48k.squeeze(1) if pred_48k.dim() == 3 else pred_48k
-            target = target_48k.squeeze(1) if target_48k.dim() == 3 else target_48k
-            min_len = min(pred.shape[-1], target.shape[-1])
-            pred = pred[..., :min_len]
-            target = target[..., :min_len]
+            pred, target, min_len = align_audio(pred_48k, target_48k)
 
             pred_gan, target_gan, gan_crop_len_samples, padding_ratio = build_gan_crops(
                 pred=pred,
@@ -824,12 +847,7 @@ def main():
             )
 
             # Mask padding region
-            mask = (
-                torch.arange(min_len, device=pred.device)[None, :]
-                < lengths_48k[:, None]
-            )
-            pred = pred * mask
-            target = target * mask
+            pred, target = apply_length_mask(pred, target, lengths_48k, min_len)
 
             # Reshape to (B, 1, T) for discriminators (padding excluded by random crop)
             pred_wav = pred_gan.unsqueeze(1)
@@ -837,9 +855,8 @@ def main():
 
             # Align dtype with discriminator params (handles generator checkpoint
             # loaded in bf16 when mixed_precision=no)
-            _disc_dtype = next(mpd.parameters()).dtype
-            pred_wav = pred_wav.to(dtype=_disc_dtype)
-            target_wav = target_wav.to(dtype=_disc_dtype)
+            pred_wav = pred_wav.to(dtype=disc_dtype)
+            target_wav = target_wav.to(dtype=disc_dtype)
 
             # Update D and G under a single accumulation context so
             # `accelerator.sync_gradients` is aligned for both.
@@ -863,26 +880,9 @@ def main():
                 accelerator.backward(loss_d)
                 # Capture per-model gradient norms immediately before D step.
                 if accelerator.sync_gradients:
-                    mpd_grad_norm = (
-                        sum(
-                            p.grad.norm().item() ** 2
-                            for p in mpd.parameters()
-                            if p.grad is not None
-                        )
-                        ** 0.5
-                    )
-                    msd_grad_norm = (
-                        sum(
-                            p.grad.norm().item() ** 2
-                            for p in msd.parameters()
-                            if p.grad is not None
-                        )
-                        ** 0.5
-                    )
-                accelerator.clip_grad_norm_(
-                    list(mpd.parameters()) + list(msd.parameters()),
-                    args.max_grad_norm,
-                )
+                    mpd_grad_norm = compute_grad_norm(mpd)
+                    msd_grad_norm = compute_grad_norm(msd)
+                accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
                 optimizer_d.step()
                 scheduler_d.step()
 
@@ -915,13 +915,13 @@ def main():
                 if args.lambda_multi_res_mel > 0:
                     loss_multi_res_mel = multi_res_mel_loss_fn(pred, target)
                 else:
-                    loss_multi_res_mel = torch.tensor(0.0, device=pred.device)
+                    loss_multi_res_mel = pred.new_zeros(())
 
                 # Global dB RMS loss (inworld-ai style)
                 if args.lambda_global_rms > 0:
                     loss_global_rms = global_rms_loss(pred, target)
                 else:
-                    loss_global_rms = torch.tensor(0.0, device=pred.device)
+                    loss_global_rms = pred.new_zeros(())
 
                 # Total generator loss
                 loss_g = (
@@ -952,14 +952,6 @@ def main():
                         "d/loss_total": loss_d.item(),
                         "d/loss_mpd": loss_d_mpd.item(),
                         "d/loss_msd": loss_d_msd.item(),
-                        # "d/r_loss_mpd": loss_d_mpd_r.item(),
-                        # "d/g_loss_mpd": loss_d_mpd_g.item(),
-                        # "d/r_loss_msd": loss_d_msd_r.item(),
-                        # "d/g_loss_msd": loss_d_msd_g.item(),
-                        # "d/dr_mpd": dr_mpd.item(),
-                        # "d/dg_mpd": dg_mpd.item(),
-                        # "d/dr_msd": dr_msd.item(),
-                        # "d/dg_msd": dg_msd.item(),
                         "d/grad_norm_mpd": mpd_grad_norm,
                         "d/grad_norm_msd": msd_grad_norm,
                         "g/loss_total": loss_g.item(),
