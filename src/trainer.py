@@ -44,7 +44,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from safetensors.torch import load_file, save_file
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -204,6 +204,9 @@ def parse_args():
     )
     parser.add_argument(
         "--lr_d", type=float, default=2e-4, help="Discriminator learning rate"
+    )
+    parser.add_argument(
+        "--warmup_steps", type=int, default=0, help="Number of warmup steps (lr goes from 0 to target lr)"
     )
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
@@ -792,13 +795,36 @@ def main():
             )
             total_steps = 500000
 
-    scheduler_g = CosineAnnealingLR(
-        optimizer_g, T_max=total_steps, eta_min=args.lr_g * 0.1
-    )
-    if args.use_gan:
-        scheduler_d = CosineAnnealingLR(
-            optimizer_d, T_max=total_steps, eta_min=args.lr_d * 0.1
+    warmup_steps = args.warmup_steps
+    cosine_steps_g = max(1, total_steps - warmup_steps)
+    if warmup_steps > 0:
+        scheduler_g = SequentialLR(
+            optimizer_g,
+            schedulers=[
+                LinearLR(optimizer_g, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps),
+                CosineAnnealingLR(optimizer_g, T_max=cosine_steps_g, eta_min=args.lr_g * 0.1),
+            ],
+            milestones=[warmup_steps],
         )
+    else:
+        scheduler_g = CosineAnnealingLR(
+            optimizer_g, T_max=total_steps, eta_min=args.lr_g * 0.1
+        )
+    if args.use_gan:
+        cosine_steps_d = max(1, total_steps - warmup_steps)
+        if warmup_steps > 0:
+            scheduler_d = SequentialLR(
+                optimizer_d,
+                schedulers=[
+                    LinearLR(optimizer_d, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps),
+                    CosineAnnealingLR(optimizer_d, T_max=cosine_steps_d, eta_min=args.lr_d * 0.1),
+                ],
+                milestones=[warmup_steps],
+            )
+        else:
+            scheduler_d = CosineAnnealingLR(
+                optimizer_d, T_max=total_steps, eta_min=args.lr_d * 0.1
+            )
     else:
         scheduler_d = None
     accelerator.print(f"Total training steps: {total_steps}")
@@ -1099,14 +1125,14 @@ def main():
                         log_dict.update(
                             {
                                 "d/loss_total": loss_d.item(),
-                                "d/loss_mpd": loss_d_mpd.item(),
-                                "d/loss_msd": loss_d_msd.item(),
-                                "d/grad_norm_mpd": mpd_grad_norm,
-                                "d/grad_norm_msd": msd_grad_norm,
-                                "d/dr_mpd": dr_mpd.item(),
-                                "d/dg_mpd": dg_mpd.item(),
-                                "d/dr_msd": dr_msd.item(),
-                                "d/dg_msd": dg_msd.item(),
+                                "d/mpd_loss": loss_d_mpd.item(),
+                                "d/msd_loss": loss_d_msd.item(),
+                                "d_mpd/grad_norm": mpd_grad_norm,
+                                "d_msd/grad_norm": msd_grad_norm,
+                                "d_mpd/dr": dr_mpd.item(),
+                                "d_mpd/dg": dg_mpd.item(),
+                                "d_msd/dr": dr_msd.item(),
+                                "d_msd/dg": dg_msd.item(),
                                 "g/loss_adv": loss_g_adv.item(),
                                 "g/loss_fm": loss_fm.item(),
                                 "train/lr/discriminator": scheduler_d.get_last_lr()[0],
