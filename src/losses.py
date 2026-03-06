@@ -50,28 +50,6 @@ def generator_adversarial_loss(disc_outputs: List[List[torch.Tensor]]) -> torch.
         loss = loss + F.mse_loss(dg, torch.ones_like(dg))
     return loss
 
-"""
-
-    device = disc_real_outputs[0].device
-    loss = torch.tensor(0.0, device=device)
-    r_loss_total = torch.tensor(0.0, device=device)
-    g_loss_total = torch.tensor(0.0, device=device)
-    dr_total = torch.tensor(0.0, device=device)
-    dg_total = torch.tensor(0.0, device=device)
-    n = len(disc_real_outputs)
-    for dr, dg in zip(disc_real_outputs, disc_fake_outputs):
-        r_loss = torch.mean((1 - dr) ** 2)
-        g_loss = torch.mean(dg ** 2)
-        loss = loss + r_loss + g_loss
-        r_loss_total = r_loss_total + r_loss
-        g_loss_total = g_loss_total + g_loss
-        dr_total = dr_total + torch.mean(dr.float())
-        dg_total = dg_total + torch.mean(dg.float())
-    return loss, r_loss_total / n, g_loss_total / n, dr_total / n, dg_total / n
-
-    """
-
-
 
 def discriminator_loss(
     disc_real_outputs: List[List[torch.Tensor]],
@@ -100,6 +78,7 @@ def discriminator_loss(
         dr_total = dr_total + torch.mean(dr.float())
         dg_total = dg_total + torch.mean(dg.float())
     return loss, dr_total / n, dg_total / n
+
 
 def feature_matching_loss(
     disc_real_outputs: List[List[torch.Tensor]],

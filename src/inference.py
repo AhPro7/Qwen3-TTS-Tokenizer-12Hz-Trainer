@@ -185,8 +185,10 @@ class Qwen3TTSTokenizer48kHz:
             ckpt_config = json.load(f)
 
         new_upsample_rates = ckpt_config["new_upsample_rates"]
-        num_frozen = ckpt_config["num_frozen_decoder_modules"]
-        extra_upsample_rate = ckpt_config["extra_upsample_rate"]
+        add_48k_decoder_block = ckpt_config.get("add_48k_decoder_block", True)
+        extra_upsample_rate = (
+            ckpt_config["extra_upsample_rate"] if add_48k_decoder_block else 1
+        )
 
         print(f"Checkpoint config: upsample_rates={new_upsample_rates}")
 

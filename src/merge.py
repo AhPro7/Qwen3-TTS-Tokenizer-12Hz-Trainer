@@ -79,7 +79,10 @@ def main():
         checkpoint_config = json.load(f)
 
     new_upsample_rates = checkpoint_config["new_upsample_rates"]
-    extra_upsample_rate = checkpoint_config["extra_upsample_rate"]
+    add_48k_decoder_block = checkpoint_config.get("add_48k_decoder_block", True)
+    extra_upsample_rate = (
+        checkpoint_config["extra_upsample_rate"] if add_48k_decoder_block else 1
+    )
     num_frozen = checkpoint_config["num_frozen_decoder_modules"]
 
     print(f"New upsample_rates: {new_upsample_rates}")
