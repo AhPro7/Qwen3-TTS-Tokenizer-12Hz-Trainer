@@ -590,7 +590,7 @@ def eval_step(
         num_batches += 1
 
     model.train()
-    return {"val_mel_loss": total_mel_loss / max(num_batches, 1)}
+    return {"val/loss_multi_res_mel": total_mel_loss / max(num_batches, 1)}
 
 
 def save_checkpoint(
@@ -930,7 +930,7 @@ def main():
     # Persistent across optimizer-step logs.
     mpd_grad_norm = 0.0
     msd_grad_norm = 0.0
-    total_seq_len_accumulated = 0
+    total_audio_sec = 0
     gan_crop_len_samples = 0
     padding_ratio = 0.0
 
@@ -1082,10 +1082,8 @@ def main():
             # Count/log/eval/save only on real optimizer sync steps.
             if accelerator.sync_gradients:
                 global_step += 1
-                total_sec = audio_lengths.sum().item() / target_sample_rate
-                token_per_sec = 12.5
-                total_seq_len = int(total_sec * token_per_sec)
-                total_seq_len_accumulated += total_seq_len
+                audio_sec = audio_lengths.sum().item() / target_sample_rate
+                total_audio_sec += audio_sec
 
                 # Logging
                 if global_step % args.log_every == 0:
@@ -1094,8 +1092,8 @@ def main():
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
                         "lr/generator": scheduler_g.get_last_lr()[0],
-                        "seq_len": total_seq_len,
-                        "total_seq_len_accumulated": total_seq_len_accumulated,
+                        "train/audio_sec": audio_sec,
+                        "train/total_audio_hour": total_audio_sec / 3600.0,
                     }
                     if args.use_gan:
                         log_dict.update(
@@ -1144,8 +1142,8 @@ def main():
                     )
                     accelerator.log(val_losses, step=global_step)
 
-                    if val_losses["val_mel_loss"] < best_val_loss:
-                        best_val_loss = val_losses["val_mel_loss"]
+                    if val_losses["val/loss_multi_res_mel"] < best_val_loss:
+                        best_val_loss = val_losses["val/loss_multi_res_mel"]
                         save_checkpoint(
                             model,
                             mpd,
