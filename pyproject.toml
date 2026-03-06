@@ -3,7 +3,7 @@ name = "qwen3-tts-tokenizer-12hz-trainer"
 version = "0.0.1"
 description = "Qwen3 TTS Tokenizer 12Hz Trainer"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
   "transformers==4.57.3",
   "accelerate==1.12.0",
@@ -28,5 +28,7 @@ dependencies = [
   "qwen-tts>=0.1.1",
 ]
 
-[tool.uv]
-no-build-isolation-package = ["flash-attn"]
+# third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+

@@ -29,3 +29,4 @@ uv.lock
 datasets/
 datasets
 output/
+wandb/
