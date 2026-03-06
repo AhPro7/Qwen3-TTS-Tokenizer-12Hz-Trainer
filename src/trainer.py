@@ -185,20 +185,16 @@ def parse_args():
         help="Train the entire Qwen3TTSTokenizerV2Decoder (including pre_conv, pre_transformer, upsample). When False, only trains the new/unfrozen decoder blocks.",
     )
 
-    # Generator checkpoint (warm-start from reconstruction-only training)
-    parser.add_argument(
-        "--resume_generator_from",
-        type=str,
-        default=None,
-        help="Path to reconstruction-only training checkpoint (e.g., run1/checkpoint-best)",
-    )
-
-    # Full GAN checkpoint resume
+    # Checkpoint resume
     parser.add_argument(
         "--resume_from",
         type=str,
         default=None,
-        help="Resume full GAN training from checkpoint",
+        help=(
+            "Resume training from a checkpoint directory. "
+            "Always loads decoder_block.safetensors (generator weights). "
+            "Also restores discriminator and optimizer/scheduler states if present."
+        ),
     )
 
     # Training settings
@@ -503,20 +499,20 @@ def create_model(args, accelerator):
         decoder, num_frozen, train_full_decoder=args.train_full_decoder
     )
 
-    # Load pre-trained generator weights if provided
-    if args.resume_generator_from:
-        checkpoint_path = Path(args.resume_generator_from) / "decoder_block.safetensors"
+    # Load generator weights from checkpoint
+    if args.resume_from:
+        checkpoint_path = Path(args.resume_from) / "decoder_block.safetensors"
         if checkpoint_path.exists():
             accelerator.print(f"Loading generator weights from {checkpoint_path}...")
             trained_weights = load_file(str(checkpoint_path))
             missing, unexpected = decoder.load_state_dict(trained_weights, strict=False)
             accelerator.print(
-                f"Generator warm-start: {len(missing)} missing (frozen layers), "
+                f"Generator weights loaded: {len(missing)} missing, "
                 f"{len(unexpected)} unexpected"
             )
         else:
             accelerator.print(
-                f"WARNING: Generator checkpoint not found at {checkpoint_path}"
+                f"WARNING: decoder_block.safetensors not found at {checkpoint_path}"
             )
 
     return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
@@ -843,11 +839,11 @@ def main():
     elif args.log_with:
         accelerator.init_trackers(project_name=args.wandb_project)
 
-    # Resume from full GAN checkpoint
+    # Resume training state (generator weights already loaded in create_model())
     start_step = 0
     start_epoch = 0
     if args.resume_from:
-        accelerator.print(f"Resuming training from {args.resume_from}...")
+        accelerator.print(f"Resuming training state from {args.resume_from}...")
         checkpoint_dir = Path(args.resume_from)
 
         # Load checkpoint config to check num_frozen compatibility
