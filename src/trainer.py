@@ -801,7 +801,7 @@ def main():
         scheduler_g = SequentialLR(
             optimizer_g,
             schedulers=[
-                LinearLR(optimizer_g, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps),
+                LinearLR(optimizer_g, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
                 CosineAnnealingLR(optimizer_g, T_max=cosine_steps_g, eta_min=args.lr_g * 0.1),
             ],
             milestones=[warmup_steps],
@@ -816,7 +816,7 @@ def main():
             scheduler_d = SequentialLR(
                 optimizer_d,
                 schedulers=[
-                    LinearLR(optimizer_d, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps),
+                    LinearLR(optimizer_d, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps),
                     CosineAnnealingLR(optimizer_d, T_max=cosine_steps_d, eta_min=args.lr_d * 0.1),
                 ],
                 milestones=[warmup_steps],
