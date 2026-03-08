@@ -9,7 +9,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets/val/*.tar"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
-RUN_NUMBER=5
+RUN_NUMBER=6
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
@@ -19,8 +19,8 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --no_resume_optimizer \
     --batch_size 8 \
     --num_decoder_block_frozen 0 \
-    --lr_g 2e-5 \
-    --lr_d 2e-5 \
+    --lr_g 1e-5 \
+    --lr_d 1e-5 \
     --max_train_steps 1000000 \
     --gradient_accumulation_steps 4 \
     --max_audio_length 3.0 \
@@ -28,6 +28,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_fm 1.0 \
     --lambda_multi_res_mel 15.0 \
     --lambda_global_rms 1.0 \
+    --lambda_d_msd 0.1 \
     --save_every 1250 \
     --eval_every 250 \
     --log_every 2 \
