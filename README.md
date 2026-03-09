@@ -32,6 +32,34 @@ For a concrete example of what this trainer produces, see the model card for [ta
 └── pyproject.toml
 ```
 
+## Dataset Preparation
+
+Use `scripts/hf_to_webdataset.py` to convert a HuggingFace dataset into the WebDataset format required for training.
+
+```bash
+uv run python scripts/hf_to_webdataset.py \
+    "my-org/my-voice-dataset" datasets/ \
+    --shard-size 1000 \
+    --val-percent 5.0
+```
+
+This will create `datasets/train/*.tar` and `datasets/val/*.tar` shards.
+Each audio clip is resampled to **48 kHz mono 16-bit FLAC**, and codec codes are extracted with the Qwen3-TTS-Tokenizer-12Hz model.
+
+Key options:
+
+| Option | Default | Description |
+|---|---|---|
+| `--shard-size` | `1000` | Number of samples per `.tar` shard |
+| `--val-percent` | `0.1` | Percentage of samples for the validation set |
+| `--max-duration` | `40.0` | Skip clips longer than this many seconds |
+| `--batch-duration` | `160.0` | Seconds of audio per tokenizer batch (tune for GPU memory) |
+| `--shuffle-buffer` | `100` | Streaming shuffle buffer size |
+| `--dataset-config` | — | HuggingFace dataset subset/config name |
+| `--split` | `train` | Dataset split to load |
+
+Run `uv run python scripts/hf_to_webdataset.py --help` for the full list.
+
 ## Dataset Format
 
 Training data must be in **WebDataset** (`.tar`) format. Each sample in a shard must contain:

@@ -26,6 +26,9 @@ dependencies = [
   "black>=26.1.0",
   "matplotlib>=3.10.8",
   "qwen-tts>=0.1.1",
+  "loguru>=0.7.3",
+  "resampy>=0.4.3",
+  "torchcodec>=0.10.0",
 ]
 
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
