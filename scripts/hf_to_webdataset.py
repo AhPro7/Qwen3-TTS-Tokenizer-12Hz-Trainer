@@ -23,6 +23,8 @@ import argparse
 import io
 import warnings
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import numpy as np
 import pyloudnorm as pyln
@@ -403,6 +405,69 @@ def _tokenize_and_write(
 
 
 # ---------------------------------------------------------------------------
+# Preprocessing pipeline (background thread)
+# ---------------------------------------------------------------------------
+
+
+def _preprocess_worker(
+    shuffled_dataset,
+    assembler: DurationAssembler,
+    vad_model,
+    silence_gap: float,
+    min_voiced: float,
+    stage_size: int,
+    rng: np.random.Generator,
+    out_queue: "Queue[list[tuple[np.ndarray, np.ndarray]] | None]",
+    pbar: tqdm,
+    skipped_ref: list[int],
+) -> None:
+    """Background thread: dataset iteration, VAD, chunking, staging, and shuffle.
+
+    Puts batches of (chunk_24k, chunk_48k) tuples into `out_queue`.
+    Puts None as a sentinel when all data has been enqueued.
+    """
+    staging: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def flush_to_queue(force: bool = False) -> None:
+        if not staging:
+            return
+        rng.shuffle(staging)
+        cut = len(staging) if force else len(staging) // 2
+        batch, staging[:] = staging[:cut], staging[cut:]
+        if batch:
+            out_queue.put(batch)
+
+    for voice in shuffled_dataset:
+        audio_array = voice["audio"]["array"]
+        sr = voice["audio"]["sampling_rate"]
+        try:
+            audio_48k = prepare_audio_vad(
+                audio_array, sr, vad_model, silence_gap, min_voiced
+            )
+        except Exception as e:
+            logger.warning(f"Audio processing failed: {e}")
+            skipped_ref[0] += 1
+            continue
+
+        for chunk_48k in assembler.add(audio_48k):
+            chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
+            staging.append((chunk_24k, chunk_48k))
+            pbar.update(1)
+
+        if len(staging) >= stage_size:
+            flush_to_queue(force=False)
+
+    # Flush assembler tail
+    for chunk_48k in assembler.flush():
+        chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
+        staging.append((chunk_24k, chunk_48k))
+        pbar.update(1)
+
+    flush_to_queue(force=True)
+    out_queue.put(None)  # sentinel
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -515,68 +580,58 @@ def main():
     train_writer = ShardWriter(train_dir, args.shard_size)
     val_writer = ShardWriter(val_dir, args.shard_size)
 
-    rng = np.random.default_rng(args.seed)
+    # Two independent RNGs: one for staging shuffle (background), one for val split (main)
+    rng_staging = np.random.default_rng(args.seed)
+    rng_split = np.random.default_rng(args.seed + 1)
     val_fraction = args.val_percent / 100.0
 
     assembler = DurationAssembler(args.duration, args.silence_gap)
-
-    # staging: list of (chunk_24k, chunk_48k); shuffled periodically to spread
-    # chunks from the same long audio source across output shards
-    staging: list[tuple[np.ndarray, np.ndarray]] = []
     global_key = [0]  # mutable counter
-    skipped = 0
+    skipped = [0]  # mutable counter (shared with worker thread)
 
-    def flush_staging(force: bool = False) -> None:
-        """Shuffle staging and write the first half (or all if force=True)."""
-        if not staging:
-            return
-        rng.shuffle(staging)
-        if force:
-            cut = len(staging)
-        else:
-            cut = len(staging) // 2
-        batch, staging[:] = staging[:cut], staging[cut:]
-        _tokenize_and_write(
-            batch, tokenizer, train_writer, val_writer, rng, val_fraction, global_key
-        )
-        logger.info(
-            f"Wrote {cut} chunks | train={train_writer.count:,} val={val_writer.count:,}"
-        )
+    # Queue between background preprocessing thread and main tokenize thread.
+    # maxsize limits memory: at most 4 batches buffered ahead.
+    batch_queue: Queue = Queue(maxsize=4)
 
     try:
         with tqdm(desc="Processing", unit="chunks") as pbar:
-            for voice in shuffled:
-                audio_array = voice["audio"]["array"]
-                sr = voice["audio"]["sampling_rate"]
+            worker = Thread(
+                target=_preprocess_worker,
+                args=(
+                    shuffled,
+                    assembler,
+                    vad_model,
+                    args.silence_gap,
+                    args.min_voiced,
+                    args.stage_size,
+                    rng_staging,
+                    batch_queue,
+                    pbar,
+                    skipped,
+                ),
+                daemon=True,
+            )
+            worker.start()
 
-                try:
-                    audio_48k = prepare_audio_vad(
-                        audio_array, sr, vad_model, args.silence_gap, args.min_voiced
-                    )
-                except Exception as e:
-                    logger.warning(f"Audio processing failed: {e}")
-                    skipped += 1
-                    continue
+            # Main thread: consume batches and run tokenize_batch (GPU)
+            while True:
+                batch = batch_queue.get()
+                if batch is None:
+                    break
+                _tokenize_and_write(
+                    batch,
+                    tokenizer,
+                    train_writer,
+                    val_writer,
+                    rng_split,
+                    val_fraction,
+                    global_key,
+                )
+                # logger.info(
+                #     f"Wrote {len(batch)} chunks | train={train_writer.count:,} val={val_writer.count:,}"
+                # )
 
-                # Assemble into fixed-duration chunks
-                chunks = assembler.add(audio_48k)
-                for chunk_48k in chunks:
-                    chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
-                    staging.append((chunk_24k, chunk_48k))
-                    pbar.update(1)
-
-                # Periodic shuffle + partial write to spread same-source chunks
-                if len(staging) >= args.stage_size:
-                    flush_staging(force=False)
-
-            # Flush remaining audio in assembler tail
-            for chunk_48k in assembler.flush():
-                chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
-                staging.append((chunk_24k, chunk_48k))
-                pbar.update(1)
-
-            # Final flush: write everything remaining
-            flush_staging(force=True)
+            worker.join()
 
     finally:
         train_writer.close()
@@ -586,7 +641,7 @@ def main():
         f"Done!\n"
         f"  Train  : {train_writer.count:,} samples in {train_writer.num_shards} shard(s)\n"
         f"  Val    : {val_writer.count:,} samples in {val_writer.num_shards} shard(s)\n"
-        f"  Skipped: {skipped:,} source items"
+        f"  Skipped: {skipped[0]:,} source items"
     )
 
 
