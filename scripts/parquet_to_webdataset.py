@@ -22,7 +22,10 @@ Example:
 
 import argparse
 import io
+import threading
 import warnings
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Thread
@@ -42,6 +45,7 @@ from tqdm import tqdm
 
 TOKENIZER_SR = 24000  # Qwen3TTS tokenizer input sample rate
 OUTPUT_SR = 48000  # Output FLAC sample rate / assembly sample rate
+MIN_SR = 44100 # Minimum sample rate due to audio quality concerns
 
 VAD_SR = 16000  # SileroVAD internal sample rate
 VAD_WINDOW = 512  # SileroVAD frame size (samples at VAD_SR)
@@ -363,18 +367,19 @@ def _tokenize_and_write(
 # ---------------------------------------------------------------------------
 
 
-def iter_parquet_audio(
+def iter_parquet_audio_bytes(
     parquet_files: list[Path],
     rng: np.random.Generator,
     num_open: int = 8,
     batch_size: int = 64,
 ):
-    """Iterate audio by randomly interleaving multiple simultaneously-open Parquet files.
+    """Iterate raw audio bytes by randomly interleaving multiple simultaneously-open Parquet files.
 
     Maintains a pool of `num_open` open file iterators.  At each step one file
     is chosen at random from the pool and its next batch is consumed.  When a
     file is exhausted it is replaced by the next file from the remaining list
     (whose order is also randomised up-front so pool membership is diverse).
+    Yields raw audio bytes; decoding is deferred to the caller (e.g. a thread pool).
     """
     remaining = list(parquet_files)
     rng.shuffle(remaining)
@@ -407,13 +412,7 @@ def iter_parquet_audio(
             audio_bytes = audio_bytes_scalar.as_py()
             if not audio_bytes:
                 continue
-            try:
-                audio_array, sr = librosa.load(
-                    io.BytesIO(audio_bytes), sr=None, mono=False
-                )
-            except Exception as e:
-                raise RuntimeError(f"librosa.load failed in {path}: {e}")
-            yield audio_array, sr
+            yield audio_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +423,6 @@ def iter_parquet_audio(
 def _preprocess_worker(
     parquet_files: list[Path],
     assembler: DurationAssembler,
-    vad_model,
     silence_gap: float,
     min_voiced: float,
     stage_size: int,
@@ -434,8 +432,27 @@ def _preprocess_worker(
     out_queue: "Queue[list[tuple[np.ndarray, np.ndarray]] | None]",
     pbar: tqdm,
     skipped_ref: list[int],
+    num_vad_workers: int = 4,
 ) -> None:
-    """Background thread: Parquet iteration, VAD, chunking, staging, and shuffle."""
+    """Background thread: Parquet iteration, parallel VAD, chunking, staging, and shuffle.
+
+    Audio loading (librosa) and VAD processing run in a thread pool so multiple
+    samples are decoded and processed concurrently.  Each pool thread owns its
+    own SileroVAD model instance via threading.local() to avoid state sharing.
+    Results are collected in submission order so DurationAssembler sees a
+    consistent stream.
+    """
+    _tls = threading.local()
+
+    def _load_and_vad(audio_bytes: bytes) -> np.ndarray:
+        """Runs inside a thread-pool thread. Uses a per-thread VAD model."""
+        if not hasattr(_tls, "vad_model"):
+            _tls.vad_model = load_vad_model()
+        audio_array, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=False)
+        if sr < MIN_SR:
+            raise ValueError(f"Sample rate {sr} is below minimum threshold of {MIN_SR} Hz.")
+        return prepare_audio_vad(audio_array, sr, _tls.vad_model, silence_gap, min_voiced)
+
     staging: list[tuple[np.ndarray, np.ndarray]] = []
 
     def flush_to_queue(force: bool = False) -> None:
@@ -447,25 +464,47 @@ def _preprocess_worker(
         if batch:
             out_queue.put(batch)
 
-    for audio_array, sr in iter_parquet_audio(
+    # How many futures to keep in flight at once.  More = better CPU overlap,
+    # but also more memory held in decoded audio.
+    max_pending = num_vad_workers * 4
+    pending: deque = deque()
+
+    audio_iter = iter_parquet_audio_bytes(
         parquet_files, rng, num_open=num_open, batch_size=parquet_batch_size
-    ):
-        try:
-            audio_48k = prepare_audio_vad(
-                audio_array, sr, vad_model, silence_gap, min_voiced
-            )
-        except Exception as e:
-            logger.warning(f"Audio processing failed: {e}")
-            skipped_ref[0] += 1
-            continue
+    )
 
-        for chunk_48k in assembler.add(audio_48k):
-            chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
-            staging.append((chunk_24k, chunk_48k))
-            pbar.update(1)
+    with ThreadPoolExecutor(max_workers=num_vad_workers) as executor:
+        exhausted = False
 
-        if len(staging) >= stage_size:
-            flush_to_queue(force=False)
+        while not exhausted or pending:
+            # Refill the in-flight window
+            while not exhausted and len(pending) < max_pending:
+                try:
+                    audio_bytes = next(audio_iter)
+                    pending.append(executor.submit(_load_and_vad, audio_bytes))
+                except StopIteration:
+                    exhausted = True
+                    break
+
+            if not pending:
+                break
+
+            # Collect the oldest future in order to preserve assembler ordering
+            future = pending.popleft()
+            try:
+                audio_48k = future.result()
+            except Exception as e:
+                logger.warning(f"Audio processing failed: {e}")
+                skipped_ref[0] += 1
+                continue
+
+            for chunk_48k in assembler.add(audio_48k):
+                chunk_24k = resample(chunk_48k, OUTPUT_SR, TOKENIZER_SR)
+                staging.append((chunk_24k, chunk_48k))
+                pbar.update(1)
+
+            if len(staging) >= stage_size:
+                flush_to_queue(force=False)
 
     # Flush assembler tail
     for chunk_48k in assembler.flush():
@@ -498,7 +537,7 @@ def main():
     parser.add_argument(
         "--shard-size",
         type=int,
-        default=1000,
+        default=6000,
         help="Number of samples per WebDataset shard (tar file)",
     )
     parser.add_argument(
@@ -539,6 +578,15 @@ def main():
         help="Number of rows to read per iter_batches call (memory vs. throughput trade-off)",
     )
     parser.add_argument(
+        "--vad-workers",
+        type=int,
+        default=6,
+        help=(
+            "Number of parallel threads for audio loading + VAD processing. "
+            "Each thread owns its own SileroVAD model instance."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -569,7 +617,7 @@ def main():
     logger.info(f"Device: {device}")
 
     tokenizer = load_tokenizer(device)
-    vad_model = load_vad_model()
+    # VAD models are loaded lazily inside the thread-pool workers (one per thread).
 
     # Discover and shuffle Parquet files at the file level
     input_dir = Path(args.input_dir)
@@ -607,7 +655,6 @@ def main():
                 args=(
                     parquet_files,
                     assembler,
-                    vad_model,
                     args.silence_gap,
                     args.min_voiced,
                     args.stage_size,
@@ -617,6 +664,7 @@ def main():
                     batch_queue,
                     pbar,
                     skipped,
+                    args.vad_workers,
                 ),
                 daemon=True,
             )
