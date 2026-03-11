@@ -22,6 +22,7 @@ Example:
 
 import argparse
 import io
+import json
 import threading
 import warnings
 from collections import deque
@@ -49,6 +50,47 @@ MIN_SR = 44100 # Minimum sample rate due to audio quality concerns
 
 VAD_SR = 16000  # SileroVAD internal sample rate
 VAD_WINDOW = 512  # SileroVAD frame size (samples at VAD_SR)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint manager
+# ---------------------------------------------------------------------------
+
+
+class CheckpointManager:
+    """Atomically saves and loads resume checkpoints to <output_dir>/checkpoint.json."""
+
+    def __init__(self, output_dir: Path):
+        self.path = output_dir / "checkpoint.json"
+
+    def load(self) -> dict | None:
+        if not self.path.exists():
+            return None
+        try:
+            return json.loads(self.path.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to read checkpoint file {self.path}: {e}")
+            return None
+
+    def save(
+        self,
+        completed_files: set[str],
+        next_train_shard_idx: int,
+        next_val_shard_idx: int,
+        global_key: int,
+        args_snapshot: dict,
+    ) -> None:
+        data = {
+            "version": 1,
+            "completed_parquet_files": sorted(completed_files),
+            "next_train_shard_idx": next_train_shard_idx,
+            "next_val_shard_idx": next_val_shard_idx,
+            "global_key": global_key,
+            "args_snapshot": args_snapshot,
+        }
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -286,17 +328,26 @@ def encode_npy(codes_np: np.ndarray) -> bytes:
 
 
 class ShardWriter:
-    def __init__(self, output_dir: Path, shard_size: int):
+    def __init__(
+        self,
+        output_dir: Path,
+        shard_size: int,
+        start_shard_idx: int = 0,
+        on_shard_closed=None,
+    ):
         self.output_dir = output_dir
         self.shard_size = shard_size
-        self.shard_idx = 0
+        self.shard_idx = start_shard_idx
         self.count = 0
         self._writer: wds.TarWriter | None = None
+        self._on_shard_closed = on_shard_closed
         self._open_shard()
 
     def _open_shard(self):
         if self._writer is not None:
             self._writer.close()
+            if self._on_shard_closed is not None:
+                self._on_shard_closed()
         path = str(self.output_dir / f"shard-{self.shard_idx:06d}.tar")
         self._writer = wds.TarWriter(path)
         logger.debug(f"Opened shard: {path}")
@@ -372,6 +423,7 @@ def iter_parquet_audio_bytes(
     rng: np.random.Generator,
     num_open: int = 8,
     batch_size: int = 64,
+    on_file_completed=None,
 ):
     """Iterate raw audio bytes by randomly interleaving multiple simultaneously-open Parquet files.
 
@@ -388,12 +440,16 @@ def iter_parquet_audio_bytes(
     pool: list[tuple] = []
 
     def _open_next() -> None:
-        if remaining:
+        while remaining:
             path = remaining.pop()
-            it = pq.ParquetFile(path).iter_batches(
-                batch_size=batch_size, columns=["audio_data"]
-            )
-            pool.append((it, path))
+            try:
+                it = pq.ParquetFile(path).iter_batches(
+                    batch_size=batch_size, columns=["audio_data"]
+                )
+                pool.append((it, path))
+                break
+            except Exception as e:
+                print(f"[WARNING] Skipping corrupted parquet file {path}: {e}")
 
     for _ in range(min(num_open, len(remaining))):
         _open_next()
@@ -404,6 +460,13 @@ def iter_parquet_audio_bytes(
         try:
             batch = next(it)
         except StopIteration:
+            pool.pop(idx)
+            if on_file_completed is not None:
+                on_file_completed(str(path))
+            _open_next()
+            continue
+        except Exception as e:
+            print(f"[WARNING] Skipping corrupted parquet file {path}: {e}")
             pool.pop(idx)
             _open_next()
             continue
@@ -433,6 +496,7 @@ def _preprocess_worker(
     pbar: tqdm,
     skipped_ref: list[int],
     num_vad_workers: int = 4,
+    on_file_completed=None,
 ) -> None:
     """Background thread: Parquet iteration, parallel VAD, chunking, staging, and shuffle.
 
@@ -470,7 +534,8 @@ def _preprocess_worker(
     pending: deque = deque()
 
     audio_iter = iter_parquet_audio_bytes(
-        parquet_files, rng, num_open=num_open, batch_size=parquet_batch_size
+        parquet_files, rng, num_open=num_open, batch_size=parquet_batch_size,
+        on_file_completed=on_file_completed,
     )
 
     with ThreadPoolExecutor(max_workers=num_vad_workers) as executor:
@@ -605,6 +670,11 @@ def main():
         default=1.0,
         help="Voiced segments shorter than this (seconds) are discarded",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from a previous checkpoint in output_dir. Safe to always pass.",
+    )
     args = parser.parse_args()
 
     # Device
@@ -634,8 +704,85 @@ def main():
     train_dir.mkdir(parents=True, exist_ok=True)
     val_dir.mkdir(parents=True, exist_ok=True)
 
-    train_writer = ShardWriter(train_dir, args.shard_size)
-    val_writer = ShardWriter(val_dir, args.shard_size)
+    # --- Checkpoint / resume ---
+    ckpt_manager = CheckpointManager(output_dir)
+    completed_files: set[str] = set()
+    completed_files_lock = threading.Lock()
+    start_train_shard = 0
+    start_val_shard = 0
+    start_global_key = 0
+    files_to_process = parquet_files
+
+    if args.resume:
+        ckpt = ckpt_manager.load()
+        if ckpt is None:
+            logger.info("--resume specified but no checkpoint found; starting fresh.")
+        else:
+            snap = ckpt.get("args_snapshot", {})
+            if snap.get("shard_size") != args.shard_size:
+                logger.error(
+                    f"shard_size mismatch: checkpoint={snap.get('shard_size')}, "
+                    f"current={args.shard_size}. Cannot resume safely."
+                )
+                return
+            for key in ("seed", "val_percent", "duration"):
+                ckpt_val = snap.get(key)
+                cur_val = getattr(args, key.replace("-", "_"), None)
+                if ckpt_val != cur_val:
+                    logger.warning(
+                        f"--{key} changed since checkpoint ({ckpt_val} -> {cur_val}); "
+                        "results may be inconsistent."
+                    )
+            completed_set = set(ckpt.get("completed_parquet_files", []))
+            completed_files = completed_set.copy()
+            files_to_process = [p for p in parquet_files if str(p) not in completed_set]
+            start_train_shard = ckpt.get("next_train_shard_idx", 0)
+            start_val_shard = ckpt.get("next_val_shard_idx", 0)
+            start_global_key = ckpt.get("global_key", 0)
+            # Remove any partial shard left from the previous interrupted run
+            for split_dir, idx in [(train_dir, start_train_shard), (val_dir, start_val_shard)]:
+                partial = split_dir / f"shard-{idx:06d}.tar"
+                if partial.exists():
+                    logger.warning(f"Removing partial shard from previous run: {partial}")
+                    partial.unlink()
+            logger.info(
+                f"Resuming: {len(files_to_process)} parquet file(s) remaining, "
+                f"train shard {start_train_shard}, val shard {start_val_shard}, "
+                f"global_key {start_global_key}"
+            )
+
+    args_snapshot = {
+        "shard_size": args.shard_size,
+        "seed": args.seed,
+        "val_percent": args.val_percent,
+        "duration": args.duration,
+    }
+
+    def _mark_complete(path: str) -> None:
+        with completed_files_lock:
+            completed_files.add(path)
+
+    def _save_checkpoint() -> None:
+        with completed_files_lock:
+            snap = set(completed_files)
+        ckpt_manager.save(
+            completed_files=snap,
+            next_train_shard_idx=train_writer.shard_idx,
+            next_val_shard_idx=val_writer.shard_idx,
+            global_key=global_key[0],
+            args_snapshot=args_snapshot,
+        )
+
+    train_writer = ShardWriter(
+        train_dir, args.shard_size,
+        start_shard_idx=start_train_shard,
+        on_shard_closed=_save_checkpoint,
+    )
+    val_writer = ShardWriter(
+        val_dir, args.shard_size,
+        start_shard_idx=start_val_shard,
+        on_shard_closed=_save_checkpoint,
+    )
 
     # Two independent RNGs: one for pool selection + staging shuffle (background), one for val split (main)
     rng_staging = np.random.default_rng(args.seed)
@@ -643,7 +790,7 @@ def main():
     val_fraction = args.val_percent / 100.0
 
     assembler = DurationAssembler(args.duration, args.silence_gap)
-    global_key = [0]
+    global_key = [start_global_key]
     skipped = [0]
 
     batch_queue: Queue = Queue(maxsize=4)
@@ -653,7 +800,7 @@ def main():
             worker = Thread(
                 target=_preprocess_worker,
                 args=(
-                    parquet_files,
+                    files_to_process,
                     assembler,
                     args.silence_gap,
                     args.min_voiced,
@@ -665,6 +812,7 @@ def main():
                     pbar,
                     skipped,
                     args.vad_workers,
+                    _mark_complete,
                 ),
                 daemon=True,
             )
@@ -685,6 +833,7 @@ def main():
                 )
 
             worker.join()
+            _save_checkpoint()
 
     finally:
         train_writer.close()
