@@ -225,6 +225,32 @@ def decode_with_decoder(
     return wav, output_sr
 
 
+def decode_with_base_tokenizer(
+    audio_codes: np.ndarray,
+    base_tokenizer: Qwen3TTSTokenizer,
+    device: torch.device,
+    target_sr: int = 48000,
+) -> Tuple[np.ndarray, int]:
+    """Decode audio_codes using the base tokenizer's original decoder, resampled to target_sr."""
+    native_sr = base_tokenizer.config.output_sample_rate
+
+    codes_t = torch.from_numpy(audio_codes).long()
+    if codes_t.dim() == 2:
+        codes_t = codes_t.unsqueeze(0)  # [1, seq_len, 16]
+    codes_t = codes_t.transpose(1, 2).to(device)  # [1, 16, seq_len]
+
+    with torch.no_grad():
+        wav = base_tokenizer.model.decoder(codes_t)  # [1, 1, T] or [1, T]
+
+    wav = wav.squeeze().float().cpu().numpy()
+
+    # Resample to target_sr so metrics are comparable with 48kHz checkpoints
+    if native_sr != target_sr:
+        wav = librosa.resample(wav, orig_sr=native_sr, target_sr=target_sr)
+
+    return wav, target_sr
+
+
 # ---------------------------------------------------------------------------
 # HF Dataset loading
 # ---------------------------------------------------------------------------
@@ -591,18 +617,15 @@ def main():
     ]
     print(f"\nEvaluating on {len(valid_pairs)} successfully encoded samples")
 
-    # ---- Evaluate each checkpoint -------------------------------------------
-    results: Dict[str, Dict[str, List[float]]] = {}
-
-    for ckpt_path, ckpt_name in zip(checkpoint_paths, checkpoint_names):
+    # ---- Helper: evaluate a decode function on valid_pairs --------------------
+    def evaluate_decoder(
+        name: str,
+        decode_fn,
+        valid_pairs: List,
+    ) -> Dict[str, List[float]]:
         print(f"\n{'='*60}")
-        print(f"Evaluating checkpoint: {ckpt_name}")
+        print(f"Evaluating: {name}")
         print(f"{'='*60}")
-
-        with open(ckpt_path / "config.json") as f:
-            ckpt_config = json.load(f)
-
-        decoder = load_checkpoint_decoder(base_tokenizer, str(ckpt_path), device, dtype)
 
         metric_lists: Dict[str, List[float]] = {
             "multi_res_mel": [],
@@ -612,12 +635,9 @@ def main():
         if utmos_predictor is not None:
             metric_lists["utmos"] = []
 
-        for codes, (orig_array, orig_sr) in tqdm(valid_pairs, desc=ckpt_name):
+        for codes, (orig_array, orig_sr) in tqdm(valid_pairs, desc=name):
             try:
-                # Decode
-                pred_wav, pred_sr = decode_with_decoder(
-                    decoder, codes, base_tokenizer, ckpt_config, device, dtype
-                )
+                pred_wav, pred_sr = decode_fn(codes)
 
                 # Resample original to pred_sr for fair comparison
                 if orig_sr != pred_sr:
@@ -659,10 +679,8 @@ def main():
                 for k in metric_lists:
                     metric_lists[k].append(float("nan"))
 
-        results[ckpt_name] = metric_lists
-
-        # Per-checkpoint summary
-        print(f"\n  Summary for {ckpt_name}:")
+        # Per-entry summary
+        print(f"\n  Summary for {name}:")
         for metric, vals in metric_lists.items():
             valid_vals = [v for v in vals if not np.isnan(v)]
             if valid_vals:
@@ -671,6 +689,37 @@ def main():
                     f"std={np.std(valid_vals):.4f}  "
                     f"median={np.median(valid_vals):.4f}"
                 )
+
+        return metric_lists
+
+    # ---- Evaluate baseline (base tokenizer original decoder) ----------------
+    results: Dict[str, Dict[str, List[float]]] = {}
+    all_names: List[str] = []
+
+    baseline_name = f"baseline (24kHz→{args.target_sample_rate // 1000}kHz resampled)"
+    all_names.append(baseline_name)
+    results[baseline_name] = evaluate_decoder(
+        baseline_name,
+        lambda codes: decode_with_base_tokenizer(codes, base_tokenizer, device, args.target_sample_rate),
+        valid_pairs,
+    )
+
+    # ---- Evaluate each checkpoint -------------------------------------------
+    for ckpt_path, ckpt_name in zip(checkpoint_paths, checkpoint_names):
+        all_names.append(ckpt_name)
+
+        with open(ckpt_path / "config.json") as f:
+            ckpt_config = json.load(f)
+
+        decoder = load_checkpoint_decoder(base_tokenizer, str(ckpt_path), device, dtype)
+
+        results[ckpt_name] = evaluate_decoder(
+            ckpt_name,
+            lambda codes, _dec=decoder, _cfg=ckpt_config: decode_with_decoder(
+                _dec, codes, base_tokenizer, _cfg, device, dtype
+            ),
+            valid_pairs,
+        )
 
     # ---- Save summary CSV ---------------------------------------------------
     import csv
@@ -685,7 +734,7 @@ def main():
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for ckpt_name in checkpoint_names:
+        for ckpt_name in all_names:
             row = {"checkpoint": ckpt_name}
             for m in metrics_all:
                 vals = [v for v in results[ckpt_name][m] if not np.isnan(v)]
@@ -709,7 +758,7 @@ def main():
     lower_is_better = {"multi_res_mel", "mcd"}
     for m in metrics_all:
         means = {}
-        for ckpt_name in checkpoint_names:
+        for ckpt_name in all_names:
             vals = [v for v in results[ckpt_name][m] if not np.isnan(v)]
             if vals:
                 means[ckpt_name] = np.mean(vals)
@@ -724,8 +773,8 @@ def main():
 
     # ---- Visualize ----------------------------------------------------------
     print("\nGenerating plots...")
-    plot_histograms(results, checkpoint_names, output_dir)
-    plot_violin_box(results, checkpoint_names, output_dir)
+    plot_histograms(results, all_names, output_dir)
+    plot_violin_box(results, all_names, output_dir)
 
     print(f"\nAll outputs saved to: {output_dir}")
 
