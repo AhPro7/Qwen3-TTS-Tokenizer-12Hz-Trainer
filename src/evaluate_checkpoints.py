@@ -36,6 +36,8 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 from tqdm import tqdm
+import pyworld
+import pysptk
 
 # Suppress MPS-backend STFT resize deprecation warning (PyTorch internal bug, harmless)
 warnings.filterwarnings(
@@ -87,19 +89,32 @@ def resolve_dtype(dtype: str) -> torch.dtype:
     return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype]
 
 
-def mcd_score(pred: np.ndarray, target: np.ndarray, sr: int, n_mfcc: int = 13) -> float:
-    """Mel Cepstral Distortion (lower is better).
+def _extract_mcep(wav: np.ndarray, sr: int, order: int = 24, frame_period: float = 5.0) -> np.ndarray:
+    """Extract mel-cepstral coefficients using WORLD + pysptk."""
+    wav64 = wav.astype(np.float64)
+    f0, t = pyworld.dio(wav64, sr, frame_period=frame_period)
+    f0 = pyworld.stonemask(wav64, f0, t, sr)
+    sp = pyworld.cheaptrick(wav64, f0, t, sr)
+    # pysptk.mc2b expects float64 log-power spectrum
+    mcep = pysptk.sp2mc(sp, order=order, alpha=pysptk.util.mcepalpha(sr))
+    return mcep  # shape: [n_frames, order+1]
 
-    Uses n_mfcc coefficients excluding c0 (energy).
+
+def mcd_score(pred: np.ndarray, target: np.ndarray, sr: int, order: int = 24) -> float:
+    """Mel Cepstral Distortion in dB (lower is better).
+
+    Uses WORLD for spectral envelope extraction and pysptk for
+    mel-cepstral analysis. Excludes c0 (energy). Typical values: 3-10 dB.
     """
-    # n_mfcc+1 to compute, then exclude c0
-    c_pred = librosa.feature.mfcc(y=pred, sr=sr, n_mfcc=n_mfcc + 1)[1:]
-    c_tgt = librosa.feature.mfcc(y=target, sr=sr, n_mfcc=n_mfcc + 1)[1:]
-    min_len = min(c_pred.shape[1], c_tgt.shape[1])
-    if min_len == 0:
+    mcep_pred = _extract_mcep(pred, sr, order=order)
+    mcep_tgt = _extract_mcep(target, sr, order=order)
+
+    # Exclude c0, align frames
+    min_frames = min(mcep_pred.shape[0], mcep_tgt.shape[0])
+    if min_frames == 0:
         return float("nan")
-    diff = c_pred[:, :min_len] - c_tgt[:, :min_len]
-    return float((10.0 * np.sqrt(2.0) / np.log(10.0)) * np.mean(np.sqrt(np.sum(diff ** 2, axis=0))))
+    diff = mcep_pred[:min_frames, 1:] - mcep_tgt[:min_frames, 1:]
+    return float((10.0 * np.sqrt(2.0) / np.log(10.0)) * np.mean(np.sqrt(np.sum(diff ** 2, axis=1))))
 
 
 def create_discriminators() -> Tuple[HiFiGANMultiPeriodDiscriminator, "SpecDiscriminator"]:
@@ -392,7 +407,7 @@ def encode_samples(
 METRIC_LABELS = {
     "multi_res_mel": "Multi-Res Mel Loss (lower=better)",
     "utmos": "UTMOSv2 Score (higher=better)",
-    "mcd": "MCD - Mel Cepstral Distortion (lower=better)",
+    "mcd": "MCD [dB] - Mel Cepstral Distortion (lower=better)",
     "dg": "Discriminator Score dg (higher=better)",
 }
 

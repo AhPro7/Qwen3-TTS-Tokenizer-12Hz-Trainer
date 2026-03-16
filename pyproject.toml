@@ -31,6 +31,9 @@ dependencies = [
   "torchcodec>=0.10.0",
   "pyloudnorm>=0.2.0",
   "utmosv2",
+  "pysptk>=1.0.1",
+  "pyworld>=0.3.5",
+  "setuptools<=81",
 ]
 
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
