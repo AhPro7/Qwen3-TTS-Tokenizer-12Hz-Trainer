@@ -699,8 +699,25 @@ def main():
             valid_pairs,
         )
 
-    # ---- Save summary CSV ---------------------------------------------------
+    # ---- Save raw data CSV --------------------------------------------------
     import csv
+
+    raw_csv_path = output_dir / "raw_metrics.csv"
+    metrics_all = list(next(iter(results.values())).keys())
+    with open(raw_csv_path, "w", newline="") as f:
+        fieldnames = ["checkpoint", "sample_index"] + metrics_all
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for ckpt_name in all_names:
+            num_samples = len(next(iter(results[ckpt_name].values())))
+            for i in range(num_samples):
+                row = {"checkpoint": ckpt_name, "sample_index": i}
+                for m in metrics_all:
+                    row[m] = results[ckpt_name][m][i]
+                writer.writerow(row)
+    print(f"\nSaved: {raw_csv_path}")
+
+    # ---- Save summary CSV ---------------------------------------------------
 
     csv_path = output_dir / "summary_table.csv"
     with open(csv_path, "w", newline="") as f:
