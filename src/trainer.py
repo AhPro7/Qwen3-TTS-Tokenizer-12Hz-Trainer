@@ -301,6 +301,10 @@ def parse_args():
     parser.add_argument(
         "--log_every", type=int, default=10, help="Log output interval (steps)"
     )
+    parser.add_argument(
+        "--log_grad_norms", action="store_true", default=False,
+        help="Log per-loss gradient norms (expensive, off by default)"
+    )
 
     # Logging
     parser.add_argument("--log_with", type=str, default="wandb", help="Logging method")
@@ -1059,6 +1063,40 @@ def main():
                     + args.lambda_global_rms * loss_global_rms
                 )
 
+                # Per-component gradient norms (only on log steps)
+                g_grad_norms = {}
+                should_log_grad = (
+                    args.log_grad_norms
+                    and accelerator.sync_gradients
+                    and (global_step + 1) % args.log_every == 0
+                )
+                if should_log_grad:
+                    gen_params = [
+                        p for p in model.parameters() if p.requires_grad
+                    ]
+                    for gn_name, gn_loss, gn_lam in [
+                        ("g/grad_norm_adv", loss_g_adv, args.lambda_adv),
+                        ("g/grad_norm_fm", loss_fm, args.lambda_fm),
+                        ("g/grad_norm_multi_res_mel", loss_multi_res_mel, args.lambda_multi_res_mel),
+                        ("g/grad_norm_global_rms", loss_global_rms, args.lambda_global_rms),
+                    ]:
+                        if gn_lam > 0:
+                            grads = torch.autograd.grad(
+                                gn_lam * gn_loss,
+                                gen_params,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            total_norm = (
+                                sum(
+                                    g.detach().norm() ** 2
+                                    for g in grads
+                                    if g is not None
+                                )
+                                ** 0.5
+                            )
+                            g_grad_norms[gn_name] = total_norm.item()
+
                 optimizer_g.zero_grad()
                 accelerator.backward(loss_g)
                 if accelerator.sync_gradients:
@@ -1082,6 +1120,7 @@ def main():
                         "train/audio_sec": audio_sec,
                         "train/total_audio_hour": total_audio_sec / 3600.0,
                     }
+                    log_dict.update(g_grad_norms)
                     if args.use_gan:
                         log_dict.update(
                             {
