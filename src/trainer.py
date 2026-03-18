@@ -547,15 +547,11 @@ def eval_step(
     dataloader: DataLoader,
     accelerator: Accelerator,
     max_batches: int = 50,
-    mpd=None,
-    msd=None,
 ) -> dict:
     """Evaluation (mel loss only)."""
     model.eval()
 
     total_mel_loss = 0.0
-    total_fm_mpd = 0.0
-    total_fm_msd = 0.0
     num_batches = 0
 
     for batch in dataloader:
@@ -574,23 +570,10 @@ def eval_step(
 
         mel_loss = mel_loss_fn(pred, target)
         total_mel_loss += mel_loss.item()
-
-        if mpd is not None and msd is not None:
-            mpd_real = mpd(target)
-            mpd_fake = mpd(pred)
-            msd_real = msd(target)
-            msd_fake = msd(pred)
-            total_fm_mpd += feature_matching_loss(mpd_real, mpd_fake).item()
-            total_fm_msd += feature_matching_loss(msd_real, msd_fake).item()
-
         num_batches += 1
 
     model.train()
-    result = {"val/loss_multi_res_mel": total_mel_loss / max(num_batches, 1)}
-    if mpd is not None and msd is not None:
-        result["val/loss_fm_mpd"] = total_fm_mpd / max(num_batches, 1)
-        result["val/loss_fm_msd"] = total_fm_msd / max(num_batches, 1)
-    return result
+    return {"val/loss_multi_res_mel": total_mel_loss / max(num_batches, 1)}
 
 
 def save_checkpoint(
@@ -1152,8 +1135,6 @@ def main():
                                 "d_msd/dg": dg_msd.item(),
                                 "g/loss_adv": loss_g_adv.item(),
                                 "g/loss_fm": loss_fm.item(),
-                                "g/loss_fm_mpd": loss_fm_mpd.item(),
-                                "g/loss_fm_msd": loss_fm_msd.item(),
                                 "train/lr/discriminator": scheduler_d.get_last_lr()[0],
                             }
                         )
@@ -1176,9 +1157,7 @@ def main():
                     and global_step > 0
                 ):
                     val_losses = eval_step(
-                        model, multi_res_mel_loss_fn, val_dataloader, accelerator,
-                        mpd=mpd if args.use_gan else None,
-                        msd=msd if args.use_gan else None,
+                        model, multi_res_mel_loss_fn, val_dataloader, accelerator
                     )
                     accelerator.print(
                         f"\nStep {global_step} - Validation: {val_losses}"
