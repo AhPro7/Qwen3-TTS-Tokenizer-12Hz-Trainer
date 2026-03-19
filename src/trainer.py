@@ -1078,6 +1078,7 @@ def main():
     # Persistent across optimizer-step logs.
     mpd_grad_norm = 0.0
     msd_grad_norm = 0.0
+    gen_grad_norm = 0.0
     r1_loss_val = 0.0  # last computed R1 penalty (persists between reg steps)
     total_audio_sec = 0
     for epoch in range(start_epoch, args.num_epochs):
@@ -1281,6 +1282,7 @@ def main():
                 optimizer_g.zero_grad()
                 accelerator.backward(loss_g)
                 if accelerator.sync_gradients:
+                    gen_grad_norm = compute_grad_norm(model)
                     accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer_g.step()
                 scheduler_g.step()
@@ -1297,6 +1299,7 @@ def main():
                         "g/loss_total": loss_g.item(),
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
+                        "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
                         "train/total_audio_hour": total_audio_sec / 3600.0,
