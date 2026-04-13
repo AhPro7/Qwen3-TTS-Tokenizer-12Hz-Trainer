@@ -83,6 +83,17 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Decoder,
 )
 
+class DisentangledProjection(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.speaker_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.content_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x):
+        speaker_emb = self.speaker_proj(x)
+        content_emb = self.content_proj(x)
+        return speaker_emb, content_emb
+
 BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
 
 
@@ -290,6 +301,12 @@ def parse_args():
         default=1.0,
         help="Global dB RMS loss weight (inworld-ai style). 0=disabled",
     )
+    parser.add_argument(
+        "--lambda_orth",
+        type=float,
+        default=0.1,
+        help="Orthogonality cosine loss weight",
+    )
 
     # Data settings
     parser.add_argument(
@@ -385,6 +402,11 @@ class DecoderTrainingWrapper(nn.Module):
         self.decoder = decoder
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
+        
+        hidden_dim = decoder.pre_transformer.config.hidden_size
+        self.disentangle = DisentangledProjection(hidden_dim)
+        self.last_content_emb = None
+        self.last_speaker_emb = None
 
     def forward(self, codes):
         if codes.shape[1] != self.decoder.config.num_quantizers:
@@ -400,6 +422,12 @@ class DecoderTrainingWrapper(nn.Module):
             hidden = self.decoder.pre_transformer(
                 inputs_embeds=hidden
             ).last_hidden_state
+            
+            speaker_emb, content_emb = self.disentangle(hidden)
+            self.last_speaker_emb = speaker_emb
+            self.last_content_emb = content_emb
+            hidden = speaker_emb + content_emb
+            
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
                 for block in blocks:
@@ -415,6 +443,13 @@ class DecoderTrainingWrapper(nn.Module):
                 hidden = self.decoder.pre_transformer(
                     inputs_embeds=hidden
                 ).last_hidden_state
+                
+            speaker_emb, content_emb = self.disentangle(hidden)
+            self.last_speaker_emb = speaker_emb
+            self.last_content_emb = content_emb
+            hidden = speaker_emb + content_emb
+            
+            with torch.no_grad():
                 hidden = hidden.permute(0, 2, 1)
                 for blocks in self.decoder.upsample:
                     for block in blocks:
@@ -515,6 +550,9 @@ def create_model(args, accelerator):
     wrapper = DecoderTrainingWrapper(
         decoder, num_frozen, train_full_decoder=args.train_full_decoder
     )
+
+    hidden_dim = decoder.pre_transformer.config.hidden_size
+    wrapper.disentangle = DisentangledProjection(hidden_dim).to(torch.bfloat16)
 
     # Load generator weights from checkpoint
     if args.resume_from:
@@ -764,6 +802,7 @@ def save_checkpoint(
         "lambda_d_msd": args.lambda_d_msd,
         "lambda_multi_res_mel": args.lambda_multi_res_mel,
         "lambda_global_rms": args.lambda_global_rms,
+        "lambda_orth": args.lambda_orth,
         "beta1_g": args.beta1_g,
         "beta2_g": args.beta2_g,
         "beta1_d": args.beta1_d,
@@ -975,6 +1014,7 @@ def main():
             "lambda_d_msd": args.lambda_d_msd,
             "lambda_multi_res_mel": args.lambda_multi_res_mel,
             "lambda_global_rms": args.lambda_global_rms,
+            "lambda_orth": args.lambda_orth,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "extra_upsample_rate": args.extra_upsample_rate,
             "max_audio_length": args.max_audio_length,
@@ -1238,11 +1278,20 @@ def main():
                     loss_global_rms = pred.new_zeros(())
 
                 # Total generator loss
+                unwrapped_model = accelerator.unwrap_model(model)
+                speaker_emb = unwrapped_model.last_speaker_emb
+                content_emb = unwrapped_model.last_content_emb
+                
+                loss_ortho = torch.nn.functional.cosine_similarity(
+                    speaker_emb, content_emb, dim=-1
+                ).abs().mean()
+                
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
                     + args.lambda_multi_res_mel * loss_multi_res_mel
                     + args.lambda_global_rms * loss_global_rms
+                    + args.lambda_orth * loss_ortho
                 )
 
                 # Per-component gradient norms (only on log steps)
@@ -1299,6 +1348,7 @@ def main():
                         "g/loss_total": loss_g.item(),
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
+                        "g/loss_ortho": loss_ortho.item(),
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
