@@ -84,15 +84,62 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 )
 
 class DisentangledProjection(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.speaker_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.content_proj = nn.Linear(hidden_dim, hidden_dim)
+    """AutoVC-style information bottleneck for speaker/content disentanglement.
 
-    def forward(self, x):
-        speaker_emb = self.speaker_proj(x)
-        content_emb = self.content_proj(x)
-        return speaker_emb, content_emb
+    Speaker path: Linear → ReLU → attention pool across time → global vector
+                  → Linear back to hidden_dim → broadcast to all frames.
+    The temporal pooling makes it structurally impossible to encode per-frame
+    content, forcing the content path to carry that information instead.
+
+    Content path: per-frame 2-layer MLP (keeps temporal detail).
+    """
+
+    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.speaker_dim = speaker_dim
+
+        # Speaker branch: encode → pool → decode
+        self.speaker_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, speaker_dim),
+            nn.ReLU(),
+        )
+        self.speaker_attention = nn.Linear(speaker_dim, 1)  # attention weights
+        self.speaker_decoder = nn.Linear(speaker_dim, hidden_dim)
+
+        # Content branch: per-frame MLP
+        self.content_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, hidden_dim] → speaker_global: [B, speaker_dim]"""
+        h = self.speaker_encoder(x)                                 # [B, T, speaker_dim]
+        attn = torch.softmax(self.speaker_attention(h), dim=1)      # [B, T, 1]
+        return (h * attn).sum(dim=1)                                # [B, speaker_dim]
+
+    def decode_speaker(self, speaker_global: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """speaker_global: [B, speaker_dim] → [B, T, hidden_dim]"""
+        out = self.speaker_decoder(speaker_global)                  # [B, hidden_dim]
+        return out.unsqueeze(1).expand(-1, seq_len, -1)             # [B, T, hidden_dim]
+
+    def encode_content(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, hidden_dim] → content_emb: [B, T, hidden_dim]"""
+        return self.content_proj(x)
+
+    def forward(self, x: torch.Tensor):
+        """Returns (speaker_contribution, content_emb, speaker_global).
+
+        speaker_contribution: [B, T, hidden_dim]  (broadcast from global)
+        content_emb:          [B, T, hidden_dim]  (per-frame)
+        speaker_global:       [B, speaker_dim]    (for logging / swap)
+        """
+        speaker_global = self.encode_speaker(x)                       # [B, speaker_dim]
+        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])  # [B, T, H]
+        content_emb = self.encode_content(x)                          # [B, T, H]
+        return speaker_contribution, content_emb, speaker_global
 
 BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
 
@@ -403,10 +450,11 @@ class DecoderTrainingWrapper(nn.Module):
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
         
-        hidden_dim = decoder.pre_transformer.config.hidden_size
-        self.disentangle = DisentangledProjection(hidden_dim)
+        hidden_dim = 1024  # actual output dim of pre_transformer
+        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=256)
         self.last_content_emb = None
-        self.last_speaker_emb = None
+        self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
+        self.last_speaker_global = None  # [B, speaker_dim] for logging
 
     def forward(self, codes):
         if codes.shape[1] != self.decoder.config.num_quantizers:
@@ -423,10 +471,11 @@ class DecoderTrainingWrapper(nn.Module):
                 inputs_embeds=hidden
             ).last_hidden_state
             
-            speaker_emb, content_emb = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_emb
+            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
+            self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
-            hidden = speaker_emb + content_emb
+            self.last_speaker_global = speaker_global
+            hidden = speaker_contrib + content_emb
             
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
@@ -444,10 +493,11 @@ class DecoderTrainingWrapper(nn.Module):
                     inputs_embeds=hidden
                 ).last_hidden_state
                 
-            speaker_emb, content_emb = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_emb
+            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
+            self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
-            hidden = speaker_emb + content_emb
+            self.last_speaker_global = speaker_global
+            hidden = speaker_contrib + content_emb
             
             with torch.no_grad():
                 hidden = hidden.permute(0, 2, 1)
@@ -551,8 +601,8 @@ def create_model(args, accelerator):
         decoder, num_frozen, train_full_decoder=args.train_full_decoder
     )
 
-    hidden_dim = decoder.pre_transformer.config.hidden_size
-    wrapper.disentangle = DisentangledProjection(hidden_dim).to(torch.bfloat16)
+    hidden_dim = 1024  # actual output dim of pre_transformer
+    wrapper.disentangle = DisentangledProjection(hidden_dim, speaker_dim=256).to(torch.bfloat16)
 
     # Load generator weights from checkpoint
     if args.resume_from:
@@ -758,6 +808,13 @@ def save_checkpoint(
             ):
                 trainable_state_dict[k] = v.cpu()
     save_file(trainable_state_dict, str(checkpoint_dir / "decoder_block.safetensors"))
+
+    # DisentangledProjection weights (needed for voice conversion inference)
+    if hasattr(unwrapped_model, "disentangle"):
+        disentangle_state = {
+            k: v.cpu() for k, v in unwrapped_model.disentangle.state_dict().items()
+        }
+        save_file(disentangle_state, str(checkpoint_dir / "disentangle.safetensors"))
 
     # Discriminator weights (only when GAN is enabled)
     if args.use_gan and mpd is not None and msd is not None:
@@ -1207,7 +1264,7 @@ def main():
                 # R1 Discriminator Regularization
                 # (lazy: every d_reg_every optimizer steps, scaled by d_reg_every)
                 # =====================
-                if args.use_gan and args.r1 > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
+                if args.use_gan and args.r1 > 0 and args.d_reg_every > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
                     # Cast to float32: bf16 mixed precision + STFT autodiff can
                     # cause numerical instability with create_graph=True.
                     target_wav_r1 = target_wav.detach().float().requires_grad_(True)
@@ -1407,6 +1464,23 @@ def main():
                         f"\nStep {global_step} - Validation: {val_losses}"
                     )
                     accelerator.log(val_losses, step=global_step)
+
+                    # Log audio samples to W&B
+                    if accelerator.is_main_process:
+                        try:
+                            import wandb
+                            sample_batch = next(iter(val_dataloader))
+                            sample_codes = sample_batch["audio_codes"].to(accelerator.device).transpose(1, 2)
+                            sample_target = sample_batch["audio"][0].float().cpu().numpy()
+                            with torch.inference_mode():
+                                sample_pred = accelerator.unwrap_model(model)(sample_codes)
+                            sample_pred_np = sample_pred[0].squeeze().float().cpu().numpy()
+                            accelerator.log({
+                                "audio/predicted": wandb.Audio(sample_pred_np, sample_rate=48000, caption=f"step_{global_step}_pred"),
+                                "audio/target": wandb.Audio(sample_target, sample_rate=48000, caption=f"step_{global_step}_target"),
+                            }, step=global_step)
+                        except Exception as e:
+                            accelerator.print(f"Audio logging failed: {e}")
 
                     if val_losses["val/loss_multi_res_mel"] < best_val_loss:
                         best_val_loss = val_losses["val/loss_multi_res_mel"]

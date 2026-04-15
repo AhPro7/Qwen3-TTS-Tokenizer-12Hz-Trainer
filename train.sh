@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # Training settings
-TRAIN_SHARDS="${SCRIPT_DIR}/datasets/train/*.tar"
-VAL_SHARDS="${SCRIPT_DIR}/datasets/val/*.tar"
+TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
+VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 RUN_NUMBER=20
 
@@ -16,7 +16,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --val_shards "${VAL_SHARDS}" \
     --output_dir "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     --resume_from "${OUTPUT_DIR}/run18/checkpoint-step-218750" \
-    --batch_size 8 \
+    --batch_size 4 \
     --train_full_decoder \
     --num_decoder_block_frozen 0 \
     --lr_g 1e-5 \
@@ -36,4 +36,5 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --log_every 3 \
     --wandb_project Qwen3-TTS-Tokenizer-12Hz-Trainer \
     --wandb_run_name "Run${RUN_NUMBER}" \
-    --mixed_precision bf16
+    --mixed_precision bf16 \
+    --no_resume_optimizer
