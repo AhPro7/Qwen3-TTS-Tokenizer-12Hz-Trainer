@@ -55,10 +55,14 @@ warnings.filterwarnings(
     module="torch.functional",
 )
 
-# Add project root to path (for `import xcodec2`)
-sys.path.insert(0, str(Path(__file__).parent.parent))
-# Add xcodec2 dir to path (for xcodec2's internal bare imports)
-sys.path.insert(0, str(Path(__file__).parent.parent / "xcodec2"))
+# Add project root to path so `xcodec2` is importable as a package
+_project_root = str(Path(__file__).parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+# Append xcodec2 dir at the END for any bare imports inside xcodec2 modules
+_xcodec2_dir = str(Path(__file__).parent.parent / "xcodec2")
+if _xcodec2_dir not in sys.path:
+    sys.path.append(_xcodec2_dir)
 
 from xcodec2.criterions import (
     MultiResolutionMelSpectrogramLoss,
