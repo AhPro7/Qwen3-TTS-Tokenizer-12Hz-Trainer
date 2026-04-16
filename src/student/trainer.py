@@ -86,7 +86,9 @@ def teacher_encode_decode(teacher, audio: torch.Tensor, sr: int = 24_000):
         teacher_wav:    [B, S]
     """
     decoder = teacher.model.decoder
-    encoded = teacher.encode(audios=audio.cpu().numpy().tolist(), sr=sr)
+    # Qwen expects list of 1D numpy arrays, NOT .tolist() (which gives nested Python lists)
+    audio_list = [audio[i].cpu().float().numpy() for i in range(audio.shape[0])]
+    encoded = teacher.encode(audios=audio_list, sr=sr)
     codes   = encoded.audio_codes   # list of [seq_len, num_quantizers]
 
     # Stack into batch tensor [B, num_quantizers, seq_len]
