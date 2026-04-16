@@ -161,7 +161,7 @@ class StudentCodec(nn.Module):
         dec_channels: Tuple[int, ...] = (256, 128, 64, 32, 16),
         dec_resblock_kernels: Tuple[int, ...] = (3, 7, 11),
         # Teacher projection (for distillation during training)
-        teacher_hidden_dim: int = 512,    # Qwen's hidden dim
+        teacher_hidden_dim: int = 1024,   # Qwen's actual pre_transformer output dim
     ):
         super().__init__()
         self.input_sr            = input_sr
