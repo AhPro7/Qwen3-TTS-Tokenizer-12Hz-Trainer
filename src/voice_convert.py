@@ -71,6 +71,18 @@ class DisentangledProjection(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self._warm_start_init()
+
+    def _warm_start_init(self):
+        """Must match trainer.py exactly for checkpoint compatibility."""
+        for layer in self.content_proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.eye_(layer.weight)
+                nn.init.zeros_(layer.bias)
+                with torch.no_grad():
+                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
+        nn.init.uniform_(self.speaker_decoder.weight, -1e-3, 1e-3)
+        nn.init.zeros_(self.speaker_decoder.bias)
 
     def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, T, hidden_dim] → speaker_global: [B, speaker_dim]"""

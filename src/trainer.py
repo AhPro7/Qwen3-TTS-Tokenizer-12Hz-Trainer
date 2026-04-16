@@ -118,6 +118,31 @@ class DisentangledProjection(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self._warm_start_init()
+
+    def _warm_start_init(self):
+        """Warm-start so combined = speaker_contrib + content_emb ≈ x at step 0.
+
+        Strategy:
+          - content_proj layers → near-identity  (content_emb ≈ x)
+          - speaker_decoder   → near-zero        (speaker_contrib ≈ 0)
+        Result: combined ≈ 0 + x = x  → decoder hears the same signal it was
+        trained on → clean audio from step 0, no 'copper mic' artifacts.
+        Disentanglement emerges gradually through training.
+        """
+        # Content path: near-identity init
+        for layer in self.content_proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.eye_(layer.weight)      # identity
+                nn.init.zeros_(layer.bias)
+                # tiny noise to break symmetry
+                with torch.no_grad():
+                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
+
+        # Speaker decoder: near-zero so speaker_contrib ≈ 0 at init
+        nn.init.uniform_(self.speaker_decoder.weight, -1e-3, 1e-3)
+        nn.init.zeros_(self.speaker_decoder.bias)
+
     def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, T, hidden_dim] → speaker_global: [B, speaker_dim]"""
         h = self.speaker_encoder(x)                                 # [B, T, speaker_dim]

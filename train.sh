@@ -57,7 +57,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_global_rms    1.0  \
     --lambda_d_mpd         0.01 \
     --lambda_d_msd         0.1  \
-    --lambda_orth          0.5  \
+    --lambda_orth          0.05 \
     \
     --no_resume_optimizer \
     --mixed_precision bf16 \
