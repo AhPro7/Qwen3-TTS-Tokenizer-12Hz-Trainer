@@ -4,9 +4,10 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
-VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
+TRAIN_SHARDS="${PROJECT_ROOT}/datasets3/train/*.tar"
+VAL_SHARDS="${PROJECT_ROOT}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/student-codec"
 RUN_NUMBER=1
 
@@ -18,7 +19,7 @@ RUN_NUMBER=1
 
 uv run accelerate launch \
     --mixed_precision bf16 \
-    "${SCRIPT_DIR}/src/student/trainer.py" \
+    "${PROJECT_ROOT}/src/student/trainer.py" \
     \
     --train_shards  "${TRAIN_SHARDS}" \
     --val_shards    "${VAL_SHARDS}"   \
