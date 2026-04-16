@@ -39,7 +39,8 @@ import torchaudio
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))          # project root
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))  # src/ for dataset, etc.
 sys.path.append(str(Path(__file__).parent.parent.parent / "xcodec2"))
 
 from dataset import create_webdataset_loader
