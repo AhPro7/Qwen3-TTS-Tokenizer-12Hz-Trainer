@@ -1529,16 +1529,68 @@ def main():
                             import wandb
                             sample_batch = next(iter(val_dataloader))
                             sample_codes = sample_batch["audio_codes"].to(accelerator.device).transpose(1, 2)
-                            sample_target = sample_batch["audio"][0].float().cpu().numpy()
+                            sample_targets = sample_batch["audio"].float().cpu()
+                            sample_sr = target_sample_rate
+
                             with torch.inference_mode():
-                                sample_pred = accelerator.unwrap_model(model)(sample_codes)
-                            sample_pred_np = sample_pred[0].squeeze().float().cpu().numpy()
-                            accelerator.log({
-                                "audio/predicted": wandb.Audio(sample_pred_np, sample_rate=48000, caption=f"step_{global_step}_pred"),
-                                "audio/target": wandb.Audio(sample_target, sample_rate=48000, caption=f"step_{global_step}_target"),
-                            }, step=global_step)
+                                sample_preds = accelerator.unwrap_model(model)(sample_codes)
+
+                            # Log up to 4 reconstruction pairs
+                            n_log = min(4, sample_codes.shape[0])
+                            audio_log = {}
+                            for i in range(n_log):
+                                pred_np = sample_preds[i].squeeze().float().cpu().numpy()
+                                tgt_np  = sample_targets[i].numpy()
+                                audio_log[f"audio/sample{i+1}_pred"]   = wandb.Audio(pred_np, sample_rate=sample_sr, caption=f"step{global_step} pred#{i+1}")
+                                audio_log[f"audio/sample{i+1}_target"] = wandb.Audio(tgt_np,  sample_rate=sample_sr, caption=f"step{global_step} target#{i+1}")
+
+                            # Voice conversion demo: swap speaker[1] into content[0]
+                            if sample_codes.shape[0] >= 2:
+                                try:
+                                    unwrapped = accelerator.unwrap_model(model)
+                                    with torch.inference_mode():
+                                        # Get hidden states for sample 0 and 1
+                                        codes_0 = sample_codes[0:1]
+                                        codes_1 = sample_codes[1:2]
+                                        decoder = unwrapped.decoder
+
+                                        def _to_hidden(c):
+                                            h = decoder.quantizer.decode(c)
+                                            h = decoder.pre_conv(h).transpose(1, 2)
+                                            h = decoder.pre_transformer(inputs_embeds=h).last_hidden_state
+                                            return h
+
+                                        hidden_0 = _to_hidden(codes_0)
+                                        hidden_1 = _to_hidden(codes_1)
+
+                                        # Disentangle
+                                        content_0 = unwrapped.disentangle.encode_content(hidden_0)
+                                        speaker_1 = unwrapped.disentangle.encode_speaker(hidden_1)
+                                        speaker_1_contrib = unwrapped.disentangle.decode_speaker(speaker_1, content_0.shape[1])
+
+                                        combined = speaker_1_contrib + content_0  # [1, T, H]
+
+                                        # Decode combined
+                                        x = combined.permute(0, 2, 1)
+                                        for blocks in decoder.upsample:
+                                            for block in blocks:
+                                                x = block(x)
+                                        wav = x
+                                        for block in decoder.decoder:
+                                            wav = block(wav)
+                                        vc_np = wav.clamp(-1, 1).squeeze().float().cpu().numpy()
+
+                                    audio_log["audio/voice_convert_0to1"] = wandb.Audio(
+                                        vc_np, sample_rate=sample_sr,
+                                        caption=f"step{global_step} VC: content[0]+speaker[1]"
+                                    )
+                                except Exception as vc_e:
+                                    accelerator.print(f"VC audio logging failed: {vc_e}")
+
+                            accelerator.log(audio_log, step=global_step)
                         except Exception as e:
                             accelerator.print(f"Audio logging failed: {e}")
+
 
                     if val_losses["val/loss_multi_res_mel"] < best_val_loss:
                         best_val_loss = val_losses["val/loss_multi_res_mel"]
