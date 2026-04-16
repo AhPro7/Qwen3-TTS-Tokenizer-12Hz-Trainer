@@ -383,6 +383,17 @@ def parse_args():
         default=0.1,
         help="Orthogonality cosine loss weight",
     )
+    parser.add_argument(
+        "--lambda_consistency",
+        type=float,
+        default=1.0,
+        help=(
+            "Hidden consistency loss weight: MSE(speaker+content, original_hidden). "
+            "Penalizes DisentangledProjection from distorting the hidden state, "
+            "eliminating copper-mic artifacts. Naturally decays as model learns. "
+            "0 disables. Recommended: 1.0 early, then reduce to 0.1 after ~5k steps."
+        ),
+    )
 
     # Data settings
     parser.add_argument(
@@ -484,6 +495,7 @@ class DecoderTrainingWrapper(nn.Module):
         self.last_content_emb = None
         self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
         self.last_speaker_global = None  # [B, speaker_dim] for logging
+        self.last_original_hidden = None  # [B, T, hidden_dim] pre-disentangle
 
     def forward(self, codes):
         if codes.shape[1] != self.decoder.config.num_quantizers:
@@ -504,6 +516,7 @@ class DecoderTrainingWrapper(nn.Module):
             self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
             self.last_speaker_global = speaker_global
+            self.last_original_hidden = hidden.detach()  # store for consistency loss
             hidden = speaker_contrib + content_emb
             
             hidden = hidden.permute(0, 2, 1)
@@ -526,6 +539,7 @@ class DecoderTrainingWrapper(nn.Module):
             self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
             self.last_speaker_global = speaker_global
+            self.last_original_hidden = hidden.detach()  # store for consistency loss
             hidden = speaker_contrib + content_emb
             
             with torch.no_grad():
@@ -1372,12 +1386,26 @@ def main():
                     speaker_emb, content_emb, dim=-1
                 ).abs().mean()
                 
+                # Hidden consistency loss: MSE(combined, original_pre_transformer_output)
+                # Penalizes the disentangled sum from deviating from the natural
+                # hidden distribution, preventing 'copper mic' noise artifacts.
+                # Starts near 0 with warm-start init and decays naturally over training.
+                if args.lambda_consistency > 0:
+                    original_hidden = unwrapped_model.last_original_hidden
+                    combined_hidden = unwrapped_model.last_speaker_emb + unwrapped_model.last_content_emb
+                    loss_consistency = torch.nn.functional.mse_loss(
+                        combined_hidden, original_hidden
+                    )
+                else:
+                    loss_consistency = speaker_emb.new_zeros(())
+
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
                     + args.lambda_multi_res_mel * loss_multi_res_mel
                     + args.lambda_global_rms * loss_global_rms
                     + args.lambda_orth * loss_ortho
+                    + args.lambda_consistency * loss_consistency
                 )
 
                 # Per-component gradient norms (only on log steps)
@@ -1435,6 +1463,7 @@ def main():
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
                         "g/loss_ortho": loss_ortho.item(),
+                        "g/loss_consistency": loss_consistency.item(),
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
