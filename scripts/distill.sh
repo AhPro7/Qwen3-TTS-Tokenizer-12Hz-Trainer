@@ -18,7 +18,7 @@ RUN_NUMBER=1
 # Total: 10000 steps ≈ 2.5h on A100
 
 uv run accelerate launch \
-    --mixed_precision fp16 \
+    --mixed_precision no \
     "${PROJECT_ROOT}/src/student/trainer.py" \
     \
     --train_shards  "${TRAIN_SHARDS}" \
@@ -49,6 +49,6 @@ uv run accelerate launch \
     --eval_every 250 \
     --save_every 500 \
     \
-    --mixed_precision fp16 \
+    --mixed_precision no \
     --wandb_project  StudentCodec \
     --wandb_run_name "Run${RUN_NUMBER}-distill"
