@@ -60,7 +60,7 @@ from student.losses import (
 # ─── Teacher Loading ──────────────────────────────────────────────────────────
 
 def load_teacher(model_path: str, device, dtype):
-    """Load frozen Qwen teacher. Returns (tokenizer, get_hidden_fn, get_wav_fn)."""
+    """Load frozen Qwen teacher. Returns the tokenizer object."""
     print(f"Loading teacher: {model_path}")
     from qwen_tts import Qwen3TTSTokenizer
     tokenizer = Qwen3TTSTokenizer.from_pretrained(
@@ -69,10 +69,11 @@ def load_teacher(model_path: str, device, dtype):
         dtype=dtype,
         device_map=str(device) if str(device) != "cpu" else None,
     )
-    tokenizer.eval()
-    for p in tokenizer.parameters():
+    tokenizer.model.eval()
+    for p in tokenizer.model.parameters():
         p.requires_grad_(False)
-    print(f"  Teacher loaded and frozen ({sum(p.numel() for p in tokenizer.parameters())/1e6:.1f}M params)")
+    n_params = sum(p.numel() for p in tokenizer.model.parameters())
+    print(f"  Teacher loaded and frozen ({n_params/1e6:.1f}M params)")
     return tokenizer
 
 
