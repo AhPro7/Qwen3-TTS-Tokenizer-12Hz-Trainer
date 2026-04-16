@@ -200,7 +200,12 @@ def main():
         init_kwargs={"wandb": {"name": args.wandb_run_name}},
     )
 
-    dtype = torch.bfloat16 if args.mixed_precision == "bf16" else torch.float32
+    if args.mixed_precision == "bf16":
+        dtype = torch.bfloat16
+    elif args.mixed_precision == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
 
     # ── Build student model ───────────────────────────────────────
     student = StudentCodec(
