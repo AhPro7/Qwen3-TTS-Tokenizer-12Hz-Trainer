@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # coding=utf-8
 """
-Model Evaluation & Demo Script
+Model Evaluation & Comparison Script
 
-Loads a checkpoint, prints model info, and runs inference on a folder of audio files.
-Outputs: model card, reconstruction samples, voice conversion samples, RTF benchmarks.
+Loads multiple checkpoints (e.g., Original Qwen, Kanade 12.5, 25, 25clean), 
+prints model info, and runs inference on a folder of audio files.
+Outputs: model card, reconstruction samples, voice conversion samples, RTF benchmarks,
+and a comparison table across all models.
 
 Usage:
     python src/evaluate.py \
-        --checkpoint output/run55/checkpoint-best \
+        --models "Original" "12.5:output/run_12.5/checkpoint-best" "25:output/run_25/checkpoint-best" \
         --audio_dir /path/to/test_audios/ \
         --output_dir ./eval_output \
         --num_samples 4
@@ -90,22 +92,25 @@ class DisentangledProjection(nn.Module):
 
 # ── Model Loader ────────────────────────────────────────────────────────────
 class ModelEvaluator:
-    def __init__(self, checkpoint: str, base_model: str = "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    def __init__(self, name: str, checkpoint: str, base_model: str = "Qwen/Qwen3-TTS-Tokenizer-12Hz",
                  device: str = "auto", dtype: str = "bfloat16"):
+        self.name = name
         self.device = self._resolve_device(device)
         self.dtype = {"float32": torch.float32, "float16": torch.float16,
                       "bfloat16": torch.bfloat16}[dtype]
-        self.checkpoint_path = Path(checkpoint)
+        self.is_original = (checkpoint.lower() == "original")
+        self.checkpoint_path = None if self.is_original else Path(checkpoint)
 
         # Load config
         self.config = {}
-        config_path = self.checkpoint_path / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                self.config = json.load(f)
+        if not self.is_original:
+            config_path = self.checkpoint_path / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    self.config = json.load(f)
 
         # Load tokenizer
-        print(f"Loading base model: {base_model}")
+        print(f"Loading base model: {base_model} for '{self.name}'")
         self.tokenizer = Qwen3TTSTokenizer.from_pretrained(
             base_model, attn_implementation="eager", dtype=self.dtype,
             device_map=str(self.device) if self.device.type != "cpu" else None,
@@ -118,11 +123,12 @@ class ModelEvaluator:
             self._rebuild_decoder(new_upsample_rates)
 
         # Load decoder weights
-        decoder_path = self.checkpoint_path / "decoder_block.safetensors"
-        if decoder_path.exists():
-            weights = load_file(str(decoder_path))
-            self.tokenizer.model.decoder.load_state_dict(weights, strict=False)
-            print(f"  Loaded {len(weights)} decoder keys")
+        if not self.is_original:
+            decoder_path = self.checkpoint_path / "decoder_block.safetensors"
+            if decoder_path.exists():
+                weights = load_file(str(decoder_path))
+                self.tokenizer.model.decoder.load_state_dict(weights, strict=False)
+                print(f"  Loaded {len(weights)} decoder keys")
 
         if add_48k:
             extra = self.config.get("extra_upsample_rate", 2)
@@ -138,14 +144,15 @@ class ModelEvaluator:
 
         # Load DisentangledProjection
         self.disentangle = DisentangledProjection(1024, 256).to(self.device).to(self.dtype)
-        dis_path = self.checkpoint_path / "disentangle.safetensors"
         self.has_disentangle = False
-        if dis_path.exists():
-            self.disentangle.load_state_dict(load_file(str(dis_path)))
-            self.has_disentangle = True
-            print(f"  Loaded DisentangledProjection ✓")
-        else:
-            print(f"  ⚠️  disentangle.safetensors not found — VC disabled")
+        if not self.is_original:
+            dis_path = self.checkpoint_path / "disentangle.safetensors"
+            if dis_path.exists():
+                self.disentangle.load_state_dict(load_file(str(dis_path)))
+                self.has_disentangle = True
+                print(f"  Loaded DisentangledProjection ✓")
+            else:
+                print(f"  ⚠️  disentangle.safetensors not found — VC disabled")
         self.disentangle.eval()
 
         self.output_sr = self.tokenizer.get_output_sample_rate()
@@ -179,10 +186,11 @@ class ModelEvaluator:
     def _collect_model_info(self):
         dec = self.decoder
         self.info = {
-            "checkpoint": str(self.checkpoint_path),
-            "step": self.config.get("step", "unknown"),
-            "epoch": self.config.get("epoch", "unknown"),
-            "training_type": self.config.get("training_type", "unknown"),
+            "name": self.name,
+            "checkpoint": str(self.checkpoint_path) if self.checkpoint_path else "Original",
+            "step": self.config.get("step", "N/A"),
+            "epoch": self.config.get("epoch", "N/A"),
+            "training_type": self.config.get("training_type", "N/A"),
             "output_sample_rate": self.output_sr,
             "token_rate_hz": 12,
             "num_codebooks": dec.config.num_quantizers,
@@ -211,7 +219,7 @@ class ModelEvaluator:
 
     def print_model_card(self):
         print("\n" + "=" * 65)
-        print("  MODEL CARD")
+        print(f"  MODEL CARD: {self.name}")
         print("=" * 65)
         sections = [
             ("Checkpoint", [
@@ -365,8 +373,12 @@ class ModelEvaluator:
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Model Evaluation & Demo")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Model Evaluation & Comparison")
+    parser.add_argument(
+        "--models", type=str, nargs="+", required=True,
+        help="List of models to evaluate in format 'Name:Path' or 'Original'. "
+             "Example: Original 12.5:outputs/12.5 25:outputs/25 25clean:outputs/25clean"
+    )
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     parser.add_argument("--audio_dir", type=str, required=True, help="Folder with test .wav/.flac files")
     parser.add_argument("--output_dir", type=str, default="./eval_output")
@@ -377,14 +389,6 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load model
-    evaluator = ModelEvaluator(
-        checkpoint=args.checkpoint, base_model=args.base_model,
-        device=args.device, dtype=args.dtype,
-    )
-    evaluator.print_model_card()
-    evaluator.save_model_card(output_dir)
 
     # Find audio files
     audio_dir = Path(args.audio_dir)
@@ -397,96 +401,112 @@ def main():
         print(f"\n❌ No audio files found in {audio_dir}")
         return
 
-    print(f"\nFound {len(audio_files)} audio files")
+    print(f"\nFound {len(audio_files)} audio files to evaluate.")
+    
+    # Process multiple models
+    models_to_run = []
+    for m in args.models:
+        if ":" in m:
+            name, path = m.split(":", 1)
+            models_to_run.append((name, path))
+        else:
+            models_to_run.append((m, m))  # e.g. ("Original", "Original")
 
-    # ── Reconstruction ──────────────────────────────────────────────────
-    recon_dir = output_dir / "reconstructions"
-    recon_dir.mkdir(exist_ok=True)
-    all_timings = []
+    all_reports = {}
 
-    print("\n" + "=" * 65)
-    print("  RECONSTRUCTION")
-    print("=" * 65)
+    for (model_name, model_path) in models_to_run:
+        print("\n" + "#" * 70)
+        print(f"# EVALUATING MODEL: {model_name}")
+        print("#" * 70)
+        
+        model_out_dir = output_dir / model_name.replace(" ", "_")
+        model_out_dir.mkdir(exist_ok=True)
+        
+        # Load model
+        evaluator = ModelEvaluator(
+            name=model_name, checkpoint=model_path, base_model=args.base_model,
+            device=args.device, dtype=args.dtype,
+        )
+        evaluator.print_model_card()
+        evaluator.save_model_card(model_out_dir)
 
-    for i, audio_file in enumerate(audio_files):
-        print(f"\n  [{i+1}/{len(audio_files)}] {audio_file.name}")
-        wav, sr, timing = evaluator.reconstruct(str(audio_file))
+        # ── Reconstruction ──────────────────────────────────────────────────
+        recon_dir = model_out_dir / "reconstructions"
+        recon_dir.mkdir(exist_ok=True)
+        all_timings = []
 
-        out_path = recon_dir / f"recon_{audio_file.stem}.wav"
-        sf.write(str(out_path), wav, sr)
-        all_timings.append(timing)
+        print("\n  [RECONSTRUCTION]")
+        for i, audio_file in enumerate(audio_files):
+            wav, sr, timing = evaluator.reconstruct(str(audio_file))
 
-        print(f"    Input:  {timing['input_duration_s']:.2f}s")
-        print(f"    Output: {timing['output_duration_s']:.2f}s @ {sr}Hz")
-        print(f"    Encode: {timing['encode_time_s']:.4f}s | Decode: {timing['decode_time_s']:.4f}s")
-        print(f"    RTF:    {timing['rtf']:.4f}x {'✅ real-time' if timing['rtf'] < 1 else '⚠️ slower than real-time'}")
-        print(f"    Codes:  {timing['codes_shape']}  ({timing['codes_shape'][1]} codebooks × {timing['codes_shape'][2]} frames)")
-        print(f"    → {out_path}")
-
-    # RTF summary
-    avg_rtf = np.mean([t["rtf"] for t in all_timings])
-    total_audio = sum(t["input_duration_s"] for t in all_timings)
-    total_compute = sum(t["total_time_s"] for t in all_timings)
-
-    print(f"\n  RTF Summary:")
-    print(f"    Average RTF:    {avg_rtf:.4f}x")
-    print(f"    Total audio:    {total_audio:.2f}s")
-    print(f"    Total compute:  {total_compute:.4f}s")
-    print(f"    Throughput:     {total_audio/total_compute:.1f}x real-time" if total_compute > 0 else "")
-
-    # ── Voice Conversion ────────────────────────────────────────────────
-    if evaluator.has_disentangle and len(audio_files) >= 2:
-        vc_dir = output_dir / "voice_conversions"
-        vc_dir.mkdir(exist_ok=True)
-
-        print("\n" + "=" * 65)
-        print("  VOICE CONVERSION")
-        print("=" * 65)
-
-        pairs = []
-        for i in range(min(len(audio_files), 3)):
-            for j in range(min(len(audio_files), 3)):
-                if i != j:
-                    pairs.append((i, j))
-
-        for src_idx, tgt_idx in pairs[:6]:
-            src_file = audio_files[src_idx]
-            tgt_file = audio_files[tgt_idx]
-            print(f"\n  Content: {src_file.name} → Speaker: {tgt_file.name}")
-
-            wav, sr, vc_info = evaluator.voice_convert(str(src_file), str(tgt_file))
-            out_path = vc_dir / f"vc_{src_file.stem}_to_{tgt_file.stem}.wav"
+            out_path = recon_dir / f"recon_{audio_file.stem}.wav"
             sf.write(str(out_path), wav, sr)
+            all_timings.append(timing)
+            print(f"    {audio_file.name:.<30} RTF: {timing['rtf']:.4f}x")
 
-            print(f"    Source: {vc_info['source_dur_s']:.2f}s | Target: {vc_info['target_dur_s']:.2f}s")
-            print(f"    Output: {vc_info['output_dur_s']:.2f}s @ {sr}Hz")
-            print(f"    VC time: {vc_info['vc_time_s']:.4f}s")
-            print(f"    Speaker similarity (src vs tgt): {vc_info['speaker_cosine_sim']:.4f}")
-            print(f"      {'→ Very different voices ✅' if vc_info['speaker_cosine_sim'] < 0.5 else '→ Similar voices ⚠️'}")
-            print(f"    → {out_path}")
+        # RTF summary
+        avg_rtf = np.mean([t["rtf"] for t in all_timings])
+        total_audio = sum(t["input_duration_s"] for t in all_timings)
+        total_compute = sum(t["total_time_s"] for t in all_timings)
 
-    # ── Save report ─────────────────────────────────────────────────────
-    report = {
-        "model_info": evaluator.info,
-        "reconstruction_timings": all_timings,
-        "avg_rtf": round(avg_rtf, 4),
-        "total_audio_s": round(total_audio, 2),
-        "throughput_x_realtime": round(total_audio / total_compute, 1) if total_compute > 0 else 0,
-    }
-    report_path = output_dir / "eval_report.json"
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
+        # ── Voice Conversion ────────────────────────────────────────────────
+        if evaluator.has_disentangle and len(audio_files) >= 2:
+            vc_dir = model_out_dir / "voice_conversions"
+            vc_dir.mkdir(exist_ok=True)
 
-    print("\n" + "=" * 65)
-    print("  OUTPUT FILES")
-    print("=" * 65)
-    print(f"  {output_dir}/")
-    print(f"  ├── model_card.json          Model architecture & config")
-    print(f"  ├── eval_report.json         Full evaluation report")
-    print(f"  ├── reconstructions/         Reconstructed audio samples")
-    if evaluator.has_disentangle and len(audio_files) >= 2:
-        print(f"  └── voice_conversions/       Voice conversion samples")
-    print("\n  Done! ✅\n")
+            print("\n  [VOICE CONVERSION]")
+            pairs = []
+            for i in range(min(len(audio_files), 3)):
+                for j in range(min(len(audio_files), 3)):
+                    if i != j:
+                        pairs.append((i, j))
+
+            for src_idx, tgt_idx in pairs[:6]:
+                src_file = audio_files[src_idx]
+                tgt_file = audio_files[tgt_idx]
+                wav, sr, vc_info = evaluator.voice_convert(str(src_file), str(tgt_file))
+                out_path = vc_dir / f"vc_{src_file.stem}_to_{tgt_file.stem}.wav"
+                sf.write(str(out_path), wav, sr)
+                print(f"    {src_file.name} → {tgt_file.name:.<20} Sim: {vc_info['speaker_cosine_sim']:.4f}")
+        else:
+            if not evaluator.has_disentangle:
+                print("\n  [VOICE CONVERSION] ⚠️ Skipped (No DisentangledProjection)")
+
+        # ── Save report ─────────────────────────────────────────────────────
+        report = {
+            "model_info": evaluator.info,
+            "reconstruction_timings": all_timings,
+            "avg_rtf": round(avg_rtf, 4),
+            "total_audio_s": round(total_audio, 2),
+            "throughput_x_realtime": round(total_audio / total_compute, 1) if total_compute > 0 else 0,
+        }
+        report_path = model_out_dir / "eval_report.json"
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+        
+        all_reports[model_name] = report
+        
+        # Free memory before next model
+        del evaluator
+        torch.cuda.empty_cache()
+
+    # ── Final Comparison Table ──────────────────────────────────────────────
+    print("\n" + "=" * 75)
+    print("  MODEL COMPARISON SUMMARY")
+    print("=" * 75)
+    
+    header = f"| {'Model Name':<15} | {'Params (M)':<12} | {'VC Enabled?':<12} | {'Avg RTF':<10} | {'Output Hz':<10} |"
+    print(header)
+    print("|" + "-" * 17 + "|" + "-" * 14 + "|" + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 12 + "|")
+    
+    for name, rep in all_reports.items():
+        info = rep["model_info"]
+        vc_enabled = "✅ Yes" if info.get("has_disentangle", False) else "❌ No"
+        print(f"| {name:<15} | {info.get('total_params_m', 'N/A'):<12} | {vc_enabled:<12} | {rep['avg_rtf']:<10.4f} | {info.get('output_sample_rate', 'N/A'):<10} |")
+    
+    print("=" * 75)
+    print(f"\nAll outputs saved in: {output_dir}")
+    print("\nDone! ✅\n")
 
 
 if __name__ == "__main__":
