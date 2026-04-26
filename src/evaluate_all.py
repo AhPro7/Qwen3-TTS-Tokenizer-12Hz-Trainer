@@ -313,6 +313,18 @@ def main():
         (model_out / "voice_conversion").mkdir(parents=True, exist_ok=True)
 
         print(f"\n[Reconstruction]")
+        
+        # --- WARMUP PASS ---
+        # Run one dummy inference to compile CUDA kernels and avoid the cold-start penalty
+        print("  [Warmup] Initializing GPU kernels...")
+        evaluator.reconstruct(audio_files[0])
+        if evaluator.has_vc and len(audio_files) >= 2:
+            evaluator.voice_convert(audio_files[0], audio_files[1])
+        # Reset the timers after warmup
+        evaluator.total_audio_s = 0.0
+        evaluator.total_compute_s = 0.0
+        # -------------------
+
         for aud in audio_files[:4]:  # limit to 4 to save time
             name = Path(aud).name
             wav, sr, rtf = evaluator.reconstruct(aud)
