@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DisentangledProjection — Architecture Presentation</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-title">DisentangledProjection — Qwen3-TTS Voice Conversion</div>
+  <div class="nav-progress">
+    <div class="nav-dot" title="Title"></div>
+    <div class="nav-dot" title="Goal"></div>
+    <div class="nav-dot" title="Codebooks"></div>
+    <div class="nav-dot" title="Problem"></div>
+    <div class="nav-dot" title="Solution"></div>
+    <div class="nav-dot" title="Speaker Path"></div>
+    <div class="nav-dot" title="Content Path"></div>
+    <div class="nav-dot" title="Voice Conversion"></div>
+    <div class="nav-dot" title="Training"></div>
+    <div class="nav-dot" title="Losses"></div>
+    <div class="nav-dot" title="Discriminator"></div>
+    <div class="nav-dot" title="WandB"></div>
+    <div class="nav-dot" title="Summary"></div>
+    <span class="nav-counter">1 / 13</span>
+  </div>
+</nav>
+
+<div class="slides-container">
+
+  <!-- Slide 1: Title -->
+  <div class="slide active">
+    <div class="slide-inner" style="text-align:center">
+      <h1><span class="gradient-text">DisentangledProjection</span></h1>
+      <p style="font-size:1.4rem;color:var(--text);margin-bottom:2rem">Zero-Shot Voice Conversion for Qwen3-TTS-Tokenizer-12Hz</p>
+      <div class="card-grid" style="max-width:600px;margin:0 auto">
+        <div class="card" style="text-align:center">
+          <div class="card-icon">🎤</div>
+          <h3 style="color:var(--text)">Input</h3>
+          <p>Speaker A's words + Speaker B's voice</p>
+        </div>
+        <div class="card" style="text-align:center">
+          <div class="card-icon">🔊</div>
+          <h3 style="color:var(--text)">Output</h3>
+          <p>Speaker A's words <em>in</em> Speaker B's voice</p>
+        </div>
+      </div>
+      <p style="margin-top:2rem;font-size:0.9rem">Only <span class="highlight">2.6M parameters</span> added — less than <span class="highlight2">2%</span> of the model</p>
+    </div>
+  </div>
+
+  <!-- Slide 2: Goal -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>The Goal: <span class="highlight2">Zero-Shot Voice Conversion</span></h2>
+      <p style="margin-bottom:1.5rem">Separate <strong style="color:var(--accent)">WHO</strong> is speaking from <strong style="color:var(--accent2)">WHAT</strong> is being said — then swap.</p>
+      <div class="card-grid">
+        <div class="card">
+          <h3>🗣️ Speaker (WHO)</h3>
+          <p>Voice timbre, pitch range, breathiness, accent — <strong>constant</strong> across the utterance</p>
+          <p style="margin-top:0.5rem;color:var(--accent)">→ Global representation (256-dim)</p>
+        </div>
+        <div class="card">
+          <h3>📝 Content (WHAT)</h3>
+          <p>Phonemes, words, melody, timing — <strong>changes every millisecond</strong></p>
+          <p style="margin-top:0.5rem;color:var(--accent2)">→ Per-frame representation (1024-dim)</p>
+        </div>
+      </div>
+      <div class="card" style="margin-top:1rem;border-color:var(--accent)">
+        <p style="color:var(--text);text-align:center"><strong>Without separation:</strong> changing the voice also changes the words<br><strong>With separation:</strong> swap only the voice, keep the words perfectly</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 3: 16 Codebooks -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>The 16 Codebooks <span class="highlight">(RVQ)</span></h2>
+      <p style="margin-bottom:1rem">Qwen encodes audio using <strong>Residual Vector Quantization</strong> — 16 layers of successive approximation:</p>
+      <table>
+        <tr><th>Codebooks</th><th>What They Capture</th><th>Analogy</th></tr>
+        <tr><td style="color:var(--accent2)">1–4 (coarse)</td><td>Phoneme identity, pitch, F0</td><td>📝 "What word"</td></tr>
+        <tr><td style="color:var(--orange)">5–10 (mid)</td><td>Formants, prosody, energy</td><td>🎵 "How it's said"</td></tr>
+        <tr><td style="color:var(--accent)">11–16 (fine)</td><td>Timbre, vocal tract, breathiness</td><td>🗣️ "Who says it"</td></tr>
+      </table>
+      <div class="card" style="margin-top:1rem">
+        <p style="color:var(--text)"><strong>Key:</strong> At decode time, all 16 are <span class="highlight">summed into one vector</span> — the separation is implicit and leaky.</p>
+        <pre><span class="code-comment">// xcodec2/vq/residual_vq.py</span>
+quantized_out = 0.
+<span class="code-highlight">for</span> idx, layer <span class="code-highlight">in</span> enumerate(self.layers):  <span class="code-comment">// all 16</span>
+    quantized_out = quantized_out + quantized  <span class="code-comment">// SUM</span></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 4: The Problem -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>The Problem: <span class="highlight">Implicit ≠ Controllable</span></h2>
+      <p style="margin-bottom:1.5rem">Why can't we just swap codebooks 11-16 between speakers?</p>
+      <div class="card-grid">
+        <div class="card" style="border-color:var(--red)">
+          <div class="card-icon">❌</div>
+          <h3 style="color:var(--red)">Split codebooks manually</h3>
+          <p>Content leaks into ALL layers. Removing any layer destroys audio quality. Speaker info bleeds into codebooks 1-4.</p>
+        </div>
+        <div class="card" style="border-color:var(--red)">
+          <div class="card-icon">❌</div>
+          <h3 style="color:var(--red)">Retrain separate VQs</h3>
+          <p>Requires retraining the entire encoder from scratch — loses all pretrained knowledge.</p>
+        </div>
+        <div class="card" style="border-color:var(--red)">
+          <div class="card-icon">❌</div>
+          <h3 style="color:var(--red)">External speaker encoder</h3>
+          <p>ECAPA/x-vector trained on different data. Embedding doesn't align with decoder's latent space.</p>
+        </div>
+        <div class="card" style="border-color:var(--green)">
+          <div class="card-icon">✅</div>
+          <h3 style="color:var(--green)">Our approach</h3>
+          <p>Feed all 16 together, <strong>learn the separation after</strong> in the decoder's own latent space. Minimal params, end-to-end.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 5: Solution Architecture -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>Our Solution: <span class="gradient-text">DisentangledProjection</span></h2>
+      <p style="margin-bottom:1rem">Injected between the Pre-Transformer and the HiFiGAN Decoder:</p>
+      <div class="flow">
+        <div class="flow-box flow-frozen">❄️ Quantizer Decode — sum all 16 codebooks</div>
+        <div class="flow-arrow">↓</div>
+        <div class="flow-box flow-frozen">❄️ Pre-Conv + Pre-Transformer (4-layer Qwen2)</div>
+        <div class="flow-arrow">↓ hidden [B, T, 1024] — everything mixed</div>
+        <div class="flow-box flow-ours" style="min-width:450px">
+          🔥 <strong>DisentangledProjection</strong><br>
+          <span style="font-size:0.8rem">Speaker: 1024→256→pool→broadcast | Content: 1024→1024 per-frame</span>
+        </div>
+        <div class="flow-arrow">↓ speaker_contrib + content_emb</div>
+        <div class="flow-box flow-trained">🔥 Upsample + HiFiGAN Decoder → Waveform</div>
+      </div>
+      <pre><span class="code-comment">// trainer.py — DecoderTrainingWrapper.forward()</span>
+hidden = self.decoder.quantizer.decode(codes)   <span class="code-comment">// all 16 summed</span>
+hidden = self.decoder.pre_transformer(inputs_embeds=hidden).last_hidden_state
+
+<span class="code-highlight">speaker_contrib, content_emb, _ = self.disentangle(hidden)</span>
+hidden = speaker_contrib + content_emb  <span class="code-comment">// recombine → decoder</span></pre>
+    </div>
+  </div>
+
+  <!-- Slide 6: Speaker Path -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>Speaker Path: <span class="highlight">Extract Voice Identity</span></h2>
+      <p style="margin-bottom:1rem">Sees all frames → compresses each → then <strong>pools into ONE global vector</strong>. The output is the <strong>same for every frame</strong>.</p>
+      <div class="card">
+        <h3>Step-by-step with real numbers:</h3>
+        <pre>Input: 5 frames × 1024-dim  (each frame = phoneme + voice mixed)
+
+<span class="code-highlight">Step A: Compress</span> 1024 → 256 per frame (speaker_encoder)
+<span class="code-highlight">Step B: Attention</span> — learn weight per frame (which frames best show the voice?)
+   Frame 1: 0.15  Frame 2: 0.25  Frame 3: 0.20  Frame 4: 0.10  Frame 5: 0.30
+
+<span class="code-highlight">Step C: Pool</span> — weighted average → ONE vector
+   speaker_global = 0.15×f1 + 0.25×f2 + ... = [0.24, 0.67, ...] <span class="code-comment">// 256-dim</span>
+   <span style="color:var(--green)">5 frames → 1 vector. Words are GONE. Only voice survives.</span>
+
+<span class="code-highlight">Step D: Expand</span> 256 → 1024 (speaker_decoder)
+<span class="code-highlight">Step E: Broadcast</span> — copy SAME vector to ALL frames
+   Frame 1: [0.1, -0.05, ...]  ← same!
+   Frame 2: [0.1, -0.05, ...]  ← same!   <span class="code-comment">// "Ahmed's voice" everywhere</span>
+   Frame 3: [0.1, -0.05, ...]  ← same!</pre>
+      </div>
+      <pre><span class="code-comment">// The key line — time is destroyed:</span>
+<span class="code-highlight">return</span> (h * attn).<span class="code-highlight">sum(dim=1)</span>  <span class="code-comment">// [B, T, 256] → [B, 256]  TIME GONE</span></pre>
+    </div>
+  </div>
+
+  <!-- Slide 7: Content Path -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>Content Path: <span class="highlight2">Extract What Is Said</span></h2>
+      <p style="margin-bottom:1rem">Per-frame MLP — each frame processed independently. <strong>All temporal detail preserved.</strong></p>
+      <div class="card-grid">
+        <div class="card">
+          <h3>How it works</h3>
+          <pre>Frame 1 → MLP → content("م")  ← unique
+Frame 2 → MLP → content("ر")  ← unique
+Frame 3 → MLP → content("ح")  ← unique
+Frame 4 → MLP → content("ب")  ← unique
+Frame 5 → MLP → content("ا")  ← unique
+<span class="code-comment">// Each frame gets DIFFERENT output!</span></pre>
+        </div>
+        <div class="card">
+          <h3>Speaker vs Content comparison</h3>
+          <table>
+            <tr><th></th><th>Speaker</th><th>Content</th></tr>
+            <tr><td>Bottleneck</td><td style="color:var(--accent)">256 (4× compressed)</td><td style="color:var(--accent2)">1024 (full size)</td></tr>
+            <tr><td>Sees each frame?</td><td style="color:var(--green)">✅ Yes</td><td style="color:var(--green)">✅ Yes</td></tr>
+            <tr><td>Pools over time?</td><td style="color:var(--red)">✅ Yes → 1 vector</td><td style="color:var(--green)">❌ No pooling</td></tr>
+            <tr><td>Different output per frame?</td><td style="color:var(--red)">❌ Same vector copied to all</td><td style="color:var(--green)">✅ Unique per frame</td></tr>
+          </table>
+        </div>
+      </div>
+      <div class="card" style="border-color:var(--accent)">
+        <p style="color:var(--text);text-align:center"><strong>Voice identity = low-dimensional</strong> (~20 attributes: pitch, breathiness, nasality...)<br>
+        <strong>Content = high-dimensional</strong> (phonemes change every ms, subtle differences between "ba" and "pa")</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 8: Voice Conversion -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>Voice Conversion: <span class="gradient-text">The Swap</span></h2>
+      <div class="card" style="border-color:var(--green)">
+        <h3>Normal reconstruction:</h3>
+        <pre>Frame 1:  content("م") + speaker(<span style="color:var(--accent)">Ahmed</span>) = "م in Ahmed's voice"
+Frame 2:  content("ر") + speaker(<span style="color:var(--accent)">Ahmed</span>) = "ر in Ahmed's voice"
+Frame 3:  content("ح") + speaker(<span style="color:var(--accent)">Ahmed</span>) = "ح in Ahmed's voice"</pre>
+      </div>
+      <div class="card" style="border-color:var(--accent2)">
+        <h3>Voice conversion — swap the speaker:</h3>
+        <pre>Frame 1:  content("م") + speaker(<span style="color:var(--accent2)">Sara</span>)  = "م in Sara's voice"  ✅
+Frame 2:  content("ر") + speaker(<span style="color:var(--accent2)">Sara</span>)  = "ر in Sara's voice"  ✅
+Frame 3:  content("ح") + speaker(<span style="color:var(--accent2)">Sara</span>)  = "ح in Sara's voice"  ✅
+<span style="color:var(--green)">Same words, different voice!</span></pre>
+      </div>
+      <pre><span class="code-comment">// voice_convert.py — the swap is literally one line:</span>
+content_A = self.disentangle.encode_content(src_hidden)   <span class="code-comment">// A's words</span>
+speaker_B = self.disentangle.encode_speaker(tgt_hidden)   <span class="code-comment">// B's voice</span>
+<span class="code-highlight">combined = speaker_B_contrib + content_A</span>  <span class="code-comment">// B's voice + A's words</span></pre>
+    </div>
+  </div>
+
+  <!-- Slide 9: Training Loop -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>Training Loop: <span class="highlight">GAN Training</span></h2>
+      <p style="margin-bottom:1rem">Each step: Discriminator judges → Generator improves</p>
+      <div class="card-grid">
+        <div class="card">
+          <h3>🔥 Generator (our model)</h3>
+          <p>Qwen decoder + DisentangledProjection</p>
+          <p style="color:var(--text);margin-top:0.5rem">Goal: produce audio so real the discriminator can't tell</p>
+        </div>
+        <div class="card">
+          <h3>🔍 Discriminator (judge)</h3>
+          <p>MPD + MSD — two separate CNNs</p>
+          <p style="color:var(--text);margin-top:0.5rem">Goal: detect which audio is generated vs real</p>
+          <p style="color:var(--orange);margin-top:0.3rem;font-size:0.85rem">⚠️ Discarded after training — not used at inference</p>
+        </div>
+      </div>
+      <div class="card">
+        <h3>What's Trained vs Frozen</h3>
+        <table>
+          <tr><td>Quantizer, Pre-Conv, Pre-Transformer</td><td><span class="badge badge-frozen">❄️ Frozen</span></td></tr>
+          <tr><td><strong>DisentangledProjection (2.6M params)</strong></td><td><span class="badge badge-trained">🔥 Trained</span></td></tr>
+          <tr><td><strong>HiFiGAN Upsample + Decoder</strong></td><td><span class="badge badge-trained">🔥 Trained</span></td></tr>
+          <tr><td><strong>MPD + MSD Discriminators</strong></td><td><span class="badge badge-trained">🔥 Trained then discarded</span></td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 10: Losses -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>The 6 Generator Losses</h2>
+      <table>
+        <tr><th>Loss</th><th>Weight</th><th>What It Does</th></tr>
+        <tr><td style="color:var(--accent2)"><strong>Mel spectrogram</strong></td><td><strong>15.0</strong></td><td>"Does it SOUND right?" — compares at 7 frequency scales</td></tr>
+        <tr><td style="color:var(--accent2)">Feature matching</td><td>3.0</td><td>"Match discriminator's internal features" — stabilizes GAN</td></tr>
+        <tr><td style="color:var(--accent2)">Consistency</td><td>1.0</td><td>"Don't distort the hidden state" — prevents artifacts</td></tr>
+        <tr><td style="color:var(--accent2)">Global RMS</td><td>1.0</td><td>"Match overall loudness (dB)"</td></tr>
+        <tr><td style="color:var(--accent2)">Adversarial</td><td>0.3</td><td>"Fool the discriminator" — adds naturalness</td></tr>
+        <tr><td style="color:var(--accent2)">Orthogonality</td><td>0.05</td><td>"Speaker ⊥ content" — forces separation</td></tr>
+      </table>
+      <div class="card" style="margin-top:1rem;border-color:var(--accent)">
+        <h3>🔑 Our additions: Orthogonality + Consistency</h3>
+        <p><strong>Orthogonality:</strong> cos_sim(speaker, content) → 0 = perpendicular = encoding DIFFERENT info. If they overlap, swapping speaker accidentally changes words.</p>
+        <p style="margin-top:0.5rem"><strong>Consistency:</strong> MSE(speaker+content, original_hidden) → prevents the decoder from receiving distorted signals early in training.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 11: Discriminator -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>The Discriminator: <span class="highlight2">Two Judges</span></h2>
+      <div class="card-grid">
+        <div class="card">
+          <h3>🎵 MPD — Multi-Period Discriminator</h3>
+          <p>"Does the audio have natural <strong>periodic patterns</strong>?"</p>
+          <p style="margin-top:0.5rem;color:var(--text)">Examines at periods <strong>2, 3, 5, 7, 11</strong> (all prime — can't alias each other)</p>
+          <p style="margin-top:0.5rem"><strong>Catches:</strong> metallic buzzing, pitch artifacts, clicks</p>
+        </div>
+        <div class="card">
+          <h3>📊 MSD — Spectral Discriminator</h3>
+          <p>"Does the audio have natural <strong>frequency content</strong>?"</p>
+          <p style="margin-top:0.5rem;color:var(--text)">Applies STFT at <strong>8 resolutions</strong> (FFT 78 → 2296)</p>
+          <p style="margin-top:0.5rem"><strong>Catches:</strong> frequency smearing, muffled sound, robot voice</p>
+        </div>
+      </div>
+      <div class="card">
+        <h3>The GAN Game</h3>
+        <pre>Discriminator trains:  real audio → score 1.0,  fake → score 0.0
+Generator trains:      fake audio → push score toward 1.0 (fool judge)
+
+<span style="color:var(--green)">Healthy:</span>  dr stays ~1.0,  dg slowly climbs 0 → 0.7+
+<span style="color:var(--red)">Bad:</span>      dg → 1.0 too fast (disc gave up) or dg stuck at 0 (gen collapsed)</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 12: WandB -->
+  <div class="slide">
+    <div class="slide-inner stagger">
+      <h2>WandB Metrics: <span class="highlight">What to Watch</span></h2>
+      <div class="card" style="border-color:var(--green)">
+        <h3>⭐ Top 3 Metrics</h3>
+        <table>
+          <tr><td style="color:var(--green)"><code>g/loss_multi_res_mel</code></td><td>Is audio quality improving? ↓</td></tr>
+          <tr><td style="color:var(--green)"><code>g/loss_ortho</code></td><td>Is speaker/content separation working? ↓ toward 0</td></tr>
+          <tr><td style="color:var(--green)"><code>audio/voice_convert_0to1</code></td><td>🔊 Listen! Does voice conversion sound right?</td></tr>
+        </table>
+      </div>
+      <div class="card-grid">
+        <div class="card">
+          <h3>Generator Losses</h3>
+          <table>
+            <tr><td><code>g/loss_total</code></td><td>↓</td></tr>
+            <tr><td><code>g/loss_multi_res_mel</code></td><td>↓ fast then slow</td></tr>
+            <tr><td><code>g/loss_ortho</code></td><td>↓ toward 0</td></tr>
+            <tr><td><code>g/loss_consistency</code></td><td>↓ fast early</td></tr>
+            <tr><td><code>g/loss_adv</code></td><td>~0.5-1.0</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Discriminator Scores</h3>
+          <table>
+            <tr><td><code>d_mpd/dr</code> (real)</td><td>→ 1.0</td></tr>
+            <tr><td><code>d_mpd/dg</code> (fake)</td><td>slowly → 1.0</td></tr>
+            <tr><td><code>d_msd/dr</code> (real)</td><td>→ 1.0</td></tr>
+            <tr><td><code>d_msd/dg</code> (fake)</td><td>slowly → 1.0</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Slide 13: Summary -->
+  <div class="slide">
+    <div class="slide-inner" style="text-align:center">
+      <h1><span class="gradient-text">Summary</span></h1>
+      <div class="card" style="max-width:700px;margin:1.5rem auto;text-align:left;border-color:var(--accent)">
+        <p style="color:var(--text);margin-bottom:0.8rem">🎙️ Qwen3-TTS encodes audio into <strong>16 codebooks</strong> (RVQ) — all summed together</p>
+        <p style="color:var(--text);margin-bottom:0.8rem">🧠 We add <strong>DisentangledProjection</strong> (2.6M params, &lt;2% overhead) to LEARN the separation</p>
+        <p style="color:var(--text);margin-bottom:0.8rem">🔒 Speaker path: 1024→256→pool→global vector — <strong>CAN'T encode content</strong> (time destroyed)</p>
+        <p style="color:var(--text);margin-bottom:0.8rem">📝 Content path: 1024→1024 per-frame MLP — <strong>preserves all temporal detail</strong></p>
+        <p style="color:var(--text);margin-bottom:0.8rem">⊥ Orthogonality loss ensures they encode <strong>DIFFERENT information</strong></p>
+        <p style="color:var(--text)">🎯 Result: <strong>swap speaker vector → same words, new voice</strong></p>
+      </div>
+      <p style="font-size:1.2rem;color:var(--accent);margin-top:1.5rem">Zero-shot voice conversion by design, not by luck.</p>
+      <p style="margin-top:2rem;color:var(--muted);font-size:0.85rem">github.com/AhPro7/Qwen3-TTS-Tokenizer-12Hz-Trainer</p>
+    </div>
+  </div>
+
+</div>
+
+<div class="controls-hint">← → Arrow keys to navigate</div>
+<script src="script.js"></script>
+</body>
+</html>
