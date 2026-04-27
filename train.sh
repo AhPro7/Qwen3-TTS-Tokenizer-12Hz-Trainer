@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=55
+RUN_NUMBER=78
 
 # ── PoC Rationale ─────────────────────────────────────────────────────────────
 # Dataset: 50h, clips 0-7s → use max_audio_length 7.0 (no cropping waste)
@@ -31,7 +31,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --resume_from  "${OUTPUT_DIR}/run18/checkpoint-step-218750" \
     \
     --train_full_decoder \
-    --batch_size 8 \
+    --batch_size 2 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
