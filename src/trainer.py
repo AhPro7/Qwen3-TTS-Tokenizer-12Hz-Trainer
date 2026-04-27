@@ -501,32 +501,36 @@ class DecoderTrainingWrapper(nn.Module):
             for block in self.decoder.decoder:
                 wav = block(wav)
         else:
-            # Frozen part: no_grad for VRAM savings
+            # Frozen encoder: no_grad for quantizer/pre_conv/pre_transformer
+            # (these layers are BEFORE DisentangledProjection — no gradients needed)
             with torch.no_grad():
                 hidden = self.decoder.quantizer.decode(codes)
                 hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
                 hidden = self.decoder.pre_transformer(
                     inputs_embeds=hidden
                 ).last_hidden_state
-                
+
+            # DisentangledProjection: WITH gradients (this is what we're training)
             speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
             self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
             self.last_speaker_global = speaker_global
             self.last_original_hidden = hidden.detach()  # store for consistency loss
             hidden = speaker_contrib + content_emb
-            
-            with torch.no_grad():
-                hidden = hidden.permute(0, 2, 1)
-                for blocks in self.decoder.upsample:
-                    for block in blocks:
-                        hidden = block(hidden)
-                wav = hidden
-                for block in self.decoder.decoder[: self.num_frozen]:
-                    wav = block(wav)
-            wav = wav.detach()
 
-            # Trainable part: gradients enabled
+            # Frozen decoder: NO torch.no_grad() here!
+            # The frozen params have requires_grad=False so they won't update,
+            # but the computation graph flows through them so gradients reach
+            # the DisentangledProjection via the reconstruction loss.
+            hidden = hidden.permute(0, 2, 1)
+            for blocks in self.decoder.upsample:
+                for block in blocks:
+                    hidden = block(hidden)
+            wav = hidden
+            for block in self.decoder.decoder[: self.num_frozen]:
+                wav = block(wav)
+
+            # Trainable decoder tail: gradients enabled (last 2 blocks)
             for block in self.decoder.decoder[self.num_frozen :]:
                 wav = block(wav)
 
