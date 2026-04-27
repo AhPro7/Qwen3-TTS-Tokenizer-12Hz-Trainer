@@ -583,6 +583,9 @@ class DecoderTrainingWrapper(nn.Module):
         space, decode to waveform, then verify speaker identity at audio level.
         Gradients flow back to DisentangledProjection through the frozen decoder.
         """
+        # Match decoder weight dtype (bf16) — input may be float32 from detach/GRL
+        dec_dtype = next(self.decoder.parameters()).dtype
+        hidden = hidden.to(dec_dtype)
         x = hidden.permute(0, 2, 1)
         for blocks in self.decoder.upsample:
             for block in blocks:
