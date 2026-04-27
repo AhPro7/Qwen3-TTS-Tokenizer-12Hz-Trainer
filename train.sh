@@ -46,7 +46,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --no-use_gan \
     --train_full_decoder \
-    --batch_size 4 \
+    --batch_size 2 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
