@@ -8,19 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=83
+RUN_NUMBER=84
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Run 82 failed: 128-dim content bottleneck was too aggressive from scratch.
-# GAN collapsed immediately (dg≈0, mel≈9).
+# Runs 82-83 failed: content bottleneck destroyed reconstruction quality,
+# causing instant GAN collapse (D dominates before G can recover).
 #
-# This run:
-#   - Resumes decoder weights from Run 81 (already has great reconstruction)
-#   - Uses 256-dim content bottleneck (gentler squeeze, still forces disentanglement)
-#   - Does NOT resume discriminator (restarts fresh — otherwise it dominates
-#     because it's already trained while the new bottleneck is fresh)
-#   - Does NOT resume optimizer (new architecture needs fresh Adam state)
-#   - Longer disentangle warmup (1000 steps) so reconstruction stabilizes first
+# Fix: --gan_start_step 2000
+#   Phase 1 (steps 0-2000): reconstruction-only (mel + RMS + disentanglement)
+#     Content bottleneck learns to reconstruct. No GAN interference.
+#   Phase 2 (steps 2000+): GAN activates with fresh discriminator.
+#     Generator already produces decent audio → D can't trivially dominate.
+#
+# Resume from Run 81 decoder weights (good reconstruction baseline).
+# Fresh discriminator + fresh optimizer (new architecture).
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -51,6 +52,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --save_every 500 \
     --eval_every 100 \
     --log_every 5 \
+    --gan_start_step 2000 \
     \
     --lambda_adv           0.3  \
     --lambda_fm            3.0  \
@@ -74,5 +76,5 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-Bottleneck256-ResumeR81"
+    --wandb_run_name "Run${RUN_NUMBER}-GanDelay2K-Bottleneck256"
 

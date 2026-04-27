@@ -456,6 +456,18 @@ def parse_args():
     parser.add_argument(
         "--max_train_steps", type=int, default=None, help="Maximum training steps"
     )
+    parser.add_argument(
+        "--gan_start_step",
+        type=int,
+        default=0,
+        help=(
+            "Step at which GAN training activates. Before this step, only "
+            "reconstruction losses (mel/RMS/disentanglement) are used. "
+            "The discriminator is not trained and adversarial/FM losses are zero. "
+            "Set to ~2000 when using a content bottleneck to let the generator "
+            "learn reasonable reconstruction before the discriminator can collapse it."
+        ),
+    )
 
     parser.add_argument(
         "--disentangle_warmup_steps",
@@ -1357,11 +1369,22 @@ def main():
                 pred_wav = pred_wav.to(dtype=disc_dtype)
                 target_wav = target_wav.to(dtype=disc_dtype)
 
+            # GAN activation gate: no D training or adversarial loss until
+            # the generator has had time to learn reconstruction via the
+            # content bottleneck. Prevents instant GAN collapse.
+            gan_active = args.use_gan and global_step >= args.gan_start_step
+            if args.use_gan and global_step == args.gan_start_step and accelerator.is_main_process:
+                accelerator.print(
+                    f"\n{'='*50}\n"
+                    f"  🎯 GAN ACTIVATED at step {global_step}!\n"
+                    f"{'='*50}\n"
+                )
+
             # Update D and G under a single accumulation context so
             # `accelerator.sync_gradients` is aligned for both.
             accumulate_models = [model] + ([mpd, msd] if args.use_gan else [])
             with accelerator.accumulate(*accumulate_models):
-                if args.use_gan:
+                if gan_active:
                     # =====================
                     # Discriminator update
                     # =====================
@@ -1397,7 +1420,7 @@ def main():
                 # R1 Discriminator Regularization
                 # (lazy: every d_reg_every optimizer steps, scaled by d_reg_every)
                 # =====================
-                if args.use_gan and args.r1 > 0 and args.d_reg_every > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
+                if gan_active and args.r1 > 0 and args.d_reg_every > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
                     # Cast to float32: bf16 mixed precision + STFT autodiff can
                     # cause numerical instability with create_graph=True.
                     target_wav_r1 = target_wav.detach().float().requires_grad_(True)
@@ -1432,7 +1455,7 @@ def main():
                 # =====================
                 # Generator update
                 # =====================
-                if args.use_gan:
+                if gan_active:
                     # MPD (real outputs computed without grad for FM loss)
                     mpd_fake_outputs_g = mpd(pred_wav)
                     with torch.no_grad():
@@ -1702,9 +1725,10 @@ def main():
                         "train/mel_ema": mel_ema if mel_ema is not None else 0.0,
                         "train/spike_skipped_total": spike_skipped,
                         "train/batch_skipped": 1.0 if skip_this_batch else 0.0,
+                        "train/gan_active": 1.0 if gan_active else 0.0,
                     }
                     log_dict.update(g_grad_norms)
-                    if args.use_gan:
+                    if gan_active:
                         log_dict.update(
                             {
                                 "d/loss_total": loss_d.item(),
@@ -1731,7 +1755,7 @@ def main():
                         mel=loss_multi_res_mel.item(),
                         **(
                             {"d": loss_d.item(), "adv": loss_g_adv.item()}
-                            if args.use_gan
+                            if gan_active
                             else {}
                         ),
                     )
