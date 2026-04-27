@@ -210,6 +210,16 @@ def parse_args():
         default=False,
         help="Do not resume optimizer state when resuming from a checkpoint.",
     )
+    parser.add_argument(
+        "--no_resume_discriminator",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Do not resume discriminator weights when resuming from a checkpoint. "
+            "Useful when generator architecture changed (e.g. adding content bottleneck) "
+            "and the old discriminator would dominate the new generator."
+        ),
+    )
 
     # Training settings
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
@@ -1243,9 +1253,9 @@ def main():
                 f"Generator optimizer/scheduler state will NOT be restored."
             )
 
-        # Load discriminator weights (only when GAN is enabled)
+        # Load discriminator weights (only when GAN is enabled and not skipped)
         disc_path = checkpoint_dir / "discriminator.pt"
-        if args.use_gan and disc_path.exists():
+        if args.use_gan and disc_path.exists() and not args.no_resume_discriminator:
             disc_state = torch.load(disc_path, map_location="cpu")
             accelerator.unwrap_model(mpd).load_state_dict(disc_state["mpd"])
             accelerator.unwrap_model(msd).load_state_dict(disc_state["msd"])

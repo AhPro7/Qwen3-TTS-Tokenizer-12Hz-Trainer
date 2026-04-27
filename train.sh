@@ -8,26 +8,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=82
+RUN_NUMBER=83
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Run 81 had amazing reconstruction but ZERO speaker transfer — the content
-# path (1024→1024→1024 identity init) leaked all speaker information.
+# Run 82 failed: 128-dim content bottleneck was too aggressive from scratch.
+# GAN collapsed immediately (dg≈0, mel≈9).
 #
-# This run adds three fixes:
-#   1. Content bottleneck (1024→128→1024): forces content to drop speaker info
-#   2. Speaker adversarial (GRL): actively strips speaker from content path
-#   3. VC mel verification: decodes swapped-speaker audio and verifies speaker
-#      transfer at the waveform level (the "cloning discriminator")
-#
-# Expect: temporary reconstruction quality drop that recovers with training.
-# Speaker transfer should emerge after warmup period.
+# This run:
+#   - Resumes decoder weights from Run 81 (already has great reconstruction)
+#   - Uses 256-dim content bottleneck (gentler squeeze, still forces disentanglement)
+#   - Does NOT resume discriminator (restarts fresh — otherwise it dominates
+#     because it's already trained while the new bottleneck is fresh)
+#   - Does NOT resume optimizer (new architecture needs fresh Adam state)
+#   - Longer disentangle warmup (1000 steps) so reconstruction stabilizes first
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
+    \
+    --resume_from  "${OUTPUT_DIR}/run81/checkpoint-step-1000" \
+    --no_resume_optimizer \
+    --no_resume_discriminator \
     \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -40,7 +43,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --beta2_g 0.99 \
     --beta1_d 0.8 \
     --beta2_d 0.99 \
-    --warmup_steps 300 \
+    --warmup_steps 500 \
     --weight_decay 0.01 \
     --max_grad_norm 1.0 \
     \
@@ -59,17 +62,17 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    1.0  \
     --lambda_cycle         0.5  \
-    --lambda_speaker_adv   1.0  \
-    --lambda_vc_mel        2.0  \
+    --lambda_speaker_adv   0.5  \
+    --lambda_vc_mel        1.0  \
     --vc_mel_every         5    \
-    --disentangle_warmup_steps 500 \
+    --disentangle_warmup_steps 1000 \
     \
-    --content_bottleneck_dim 128 \
+    --content_bottleneck_dim 256 \
     \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-ContentBottleneck-VCMel"
+    --wandb_run_name "Run${RUN_NUMBER}-Bottleneck256-ResumeR81"
 
