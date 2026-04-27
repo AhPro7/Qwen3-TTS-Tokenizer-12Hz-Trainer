@@ -629,6 +629,9 @@ def create_model(args, accelerator):
                 "starting DisentangledProjection from warm-start init."
             )
 
+    # Cast DisentangledProjection to bf16 to match model dtype under mixed precision
+    wrapper.disentangle = wrapper.disentangle.to(torch.bfloat16)
+
     return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
 
 
