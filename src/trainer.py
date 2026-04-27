@@ -412,6 +412,17 @@ def parse_args():
         "--max_train_steps", type=int, default=None, help="Maximum training steps"
     )
 
+    parser.add_argument(
+        "--disentangle_warmup_steps",
+        type=int,
+        default=500,
+        help=(
+            "Number of steps before disentanglement losses (orth, speaker_id, cycle) "
+            "reach full weight. Linearly ramps from 0 to target lambda. "
+            "Prevents GAN collapse by letting the model stabilize first."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -1357,6 +1368,14 @@ def main():
                 content_emb = unwrapped_model.last_content_emb
                 speaker_global = unwrapped_model.last_speaker_global
                 original_hidden = unwrapped_model.last_original_hidden
+
+                # Linear warmup ramp for disentanglement losses.
+                # Prevents GAN collapse by letting the model stabilize with
+                # standard reconstruction/adversarial losses first.
+                if args.disentangle_warmup_steps > 0:
+                    dis_ramp = min(1.0, global_step / args.disentangle_warmup_steps)
+                else:
+                    dis_ramp = 1.0
                 
                 # Orthogonality: speaker ⊥ content
                 loss_ortho = torch.nn.functional.cosine_similarity(
@@ -1376,7 +1395,7 @@ def main():
                 # Speaker identity preservation: re-extract speaker from
                 # combined hidden and ensure it matches the original.
                 # This gives a direct gradient signal for voice preservation.
-                if args.lambda_speaker_id > 0:
+                if args.lambda_speaker_id > 0 and dis_ramp > 0:
                     combined_hidden = speaker_emb + content_emb
                     re_speaker = unwrapped_model.disentangle.encode_speaker(
                         combined_hidden
@@ -1390,7 +1409,7 @@ def main():
                 # In-batch speaker swap cycle consistency:
                 # Swap speakers within the batch, re-extract, ensure match.
                 # Trains the model to handle voice conversion during training.
-                if args.lambda_cycle > 0 and pred.shape[0] >= 2:
+                if args.lambda_cycle > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
                     B = speaker_global.shape[0]
                     perm = torch.randperm(B, device=speaker_global.device)
                     swapped_speaker = speaker_global[perm]
@@ -1412,10 +1431,10 @@ def main():
                     + args.lambda_fm * loss_fm
                     + args.lambda_multi_res_mel * loss_multi_res_mel
                     + args.lambda_global_rms * loss_global_rms
-                    + args.lambda_orth * loss_ortho
+                    + dis_ramp * args.lambda_orth * loss_ortho
                     + args.lambda_consistency * loss_consistency
-                    + args.lambda_speaker_id * loss_speaker_id
-                    + args.lambda_cycle * loss_cycle
+                    + dis_ramp * args.lambda_speaker_id * loss_speaker_id
+                    + dis_ramp * args.lambda_cycle * loss_cycle
                 )
 
                 # Per-component gradient norms (only on log steps)
@@ -1476,6 +1495,7 @@ def main():
                         "g/loss_consistency": loss_consistency.item(),
                         "g/loss_speaker_id": loss_speaker_id.item(),
                         "g/loss_cycle": loss_cycle.item(),
+                        "g/dis_ramp": dis_ramp,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,

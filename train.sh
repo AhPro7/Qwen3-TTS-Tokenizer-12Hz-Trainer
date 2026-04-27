@@ -61,6 +61,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    1.0  \
     --lambda_cycle         0.5  \
+    --disentangle_warmup_steps 500 \
     \
     --no_resume_optimizer \
     --mixed_precision bf16 \
