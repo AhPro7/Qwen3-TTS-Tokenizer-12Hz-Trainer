@@ -222,7 +222,7 @@ class DisentangledProjection(nn.Module):
         # If content carries speaker info, different speakers will have different repr
         # → high similarity for same speaker, low for different → contrastive loss is low
         # GRL inverts this: content encoder learns to make all repr identical
-        temp = self.log_temp.exp()
+        temp = self.speaker_adversarial.log_temp.exp()
         sim_matrix = speaker_repr @ speaker_repr.T / temp  # [B, B]
 
         # Self-similarity target: each sample is its own positive
