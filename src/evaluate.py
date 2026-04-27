@@ -102,7 +102,10 @@ class ModelEvaluator:
 
         # Load DisentangledProjection
         speaker_dim = self.config.get("speaker_dim", 256)
-        self.disentangle = DisentangledProjection(1024, speaker_dim).to(self.device).to(self.dtype)
+        content_bottleneck_dim = self.config.get("content_bottleneck_dim", 128)
+        self.disentangle = DisentangledProjection(
+            1024, speaker_dim, content_bottleneck_dim
+        ).to(self.device).to(self.dtype)
         self.has_disentangle = False
         if not self.is_original:
             dis_path = self.checkpoint_path / "disentangle.safetensors"

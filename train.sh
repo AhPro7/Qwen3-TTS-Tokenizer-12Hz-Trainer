@@ -8,21 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=81
+RUN_NUMBER=82
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Fixed the gradient-flow bug: previously torch.no_grad() after the
-# DisentangledProjection killed its gradients from reconstruction loss,
-# forcing --train_full_decoder (all 154M params trainable) which caused
-# GAN collapse every time.
+# Run 81 had amazing reconstruction but ZERO speaker transfer — the content
+# path (1024→1024→1024 identity init) leaked all speaker information.
 #
-# Now: frozen decoder has requires_grad=False (won't update) but gradients
-# flow THROUGH it to reach DisentangledProjection. Only ~12M params train:
-#   - DisentangledProjection (~4M)
-#   - Last 2 decoder blocks (~8M)
+# This run adds three fixes:
+#   1. Content bottleneck (1024→128→1024): forces content to drop speaker info
+#   2. Speaker adversarial (GRL): actively strips speaker from content path
+#   3. VC mel verification: decodes swapped-speaker audio and verifies speaker
+#      transfer at the waveform level (the "cloning discriminator")
 #
-# This is the same setup as the original working Run 18, plus disentanglement.
-# GAN should stay stable because the frozen decoder barely changes.
+# Expect: temporary reconstruction quality drop that recovers with training.
+# Speaker transfer should emerge after warmup period.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -30,7 +29,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     \
-    --batch_size 4 \
+    --batch_size 8 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
@@ -60,11 +59,17 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    1.0  \
     --lambda_cycle         0.5  \
+    --lambda_speaker_adv   1.0  \
+    --lambda_vc_mel        2.0  \
+    --vc_mel_every         5    \
     --disentangle_warmup_steps 500 \
+    \
+    --content_bottleneck_dim 128 \
     \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-GradFlowFix"
+    --wandb_run_name "Run${RUN_NUMBER}-ContentBottleneck-VCMel"
+

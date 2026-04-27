@@ -332,6 +332,32 @@ def parse_args():
             "Trains the model to handle voice conversion during training. 0 disables."
         ),
     )
+    parser.add_argument(
+        "--lambda_speaker_adv",
+        type=float,
+        default=1.0,
+        help=(
+            "Speaker adversarial loss weight on content embeddings (GRL). "
+            "Forces the content path to NOT encode speaker identity. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_vc_mel",
+        type=float,
+        default=1.0,
+        help=(
+            "Voice cloning mel verification loss weight. Decodes swapped-speaker "
+            "hidden through the full decoder, then compares time-averaged mel "
+            "spectra with the target speaker's audio. Verifies speaker transfer "
+            "at the waveform level. 0 disables (saves VRAM)."
+        ),
+    )
+    parser.add_argument(
+        "--vc_mel_every",
+        type=int,
+        default=5,
+        help="Compute VC mel verification loss every N steps (saves VRAM). Default: 5.",
+    )
 
     # Architecture
     parser.add_argument(
@@ -339,6 +365,15 @@ def parse_args():
         type=int,
         default=256,
         help="Speaker bottleneck dimension in DisentangledProjection (default: 256)",
+    )
+    parser.add_argument(
+        "--content_bottleneck_dim",
+        type=int,
+        default=128,
+        help=(
+            "Content bottleneck dimension in DisentangledProjection (default: 128). "
+            "Smaller = stronger disentanglement, weaker content detail."
+        ),
     )
 
     # Data settings
@@ -458,6 +493,7 @@ class DecoderTrainingWrapper(nn.Module):
         num_frozen_decoder_modules: int,
         train_full_decoder: bool = False,
         speaker_dim: int = 256,
+        content_bottleneck_dim: int = 128,
     ):
         super().__init__()
         self.decoder = decoder
@@ -465,7 +501,11 @@ class DecoderTrainingWrapper(nn.Module):
         self.train_full_decoder = train_full_decoder
         
         hidden_dim = 1024  # actual output dim of pre_transformer
-        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=speaker_dim)
+        self.disentangle = DisentangledProjection(
+            hidden_dim,
+            speaker_dim=speaker_dim,
+            content_bottleneck_dim=content_bottleneck_dim,
+        )
         self.last_content_emb = None
         self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
         self.last_speaker_global = None  # [B, speaker_dim] for logging
@@ -535,6 +575,22 @@ class DecoderTrainingWrapper(nn.Module):
                 wav = block(wav)
 
         return wav.clamp(min=-1, max=1)
+
+    def decode_hidden(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Decode from hidden [B, T, H] → waveform [B, T_audio].
+
+        Used for in-batch voice cloning verification: swap speakers in hidden
+        space, decode to waveform, then verify speaker identity at audio level.
+        Gradients flow back to DisentangledProjection through the frozen decoder.
+        """
+        x = hidden.permute(0, 2, 1)
+        for blocks in self.decoder.upsample:
+            for block in blocks:
+                x = block(x)
+        wav = x
+        for block in self.decoder.decoder:
+            wav = block(wav)
+        return wav.clamp(min=-1, max=1).squeeze(1)
 
 
 def create_model(args, accelerator):
@@ -622,6 +678,7 @@ def create_model(args, accelerator):
         decoder, num_frozen,
         train_full_decoder=args.train_full_decoder,
         speaker_dim=args.speaker_dim,
+        content_bottleneck_dim=args.content_bottleneck_dim,
     )
 
     # DisentangledProjection is always trainable
@@ -904,6 +961,7 @@ def save_checkpoint(
         "add_48k_decoder_block": args.add_48k_decoder_block,
         "train_full_decoder": args.train_full_decoder,
         "speaker_dim": args.speaker_dim,
+        "content_bottleneck_dim": args.content_bottleneck_dim,
         "step": step,
         "epoch": epoch,
         "training_type": "gan" if args.use_gan else "reconstruction",
@@ -916,6 +974,8 @@ def save_checkpoint(
         "lambda_orth": args.lambda_orth,
         "lambda_speaker_id": args.lambda_speaker_id,
         "lambda_cycle": args.lambda_cycle,
+        "lambda_speaker_adv": args.lambda_speaker_adv,
+        "lambda_vc_mel": args.lambda_vc_mel,
         "beta1_g": args.beta1_g,
         "beta2_g": args.beta2_g,
         "beta1_d": args.beta1_d,
@@ -1458,6 +1518,65 @@ def main():
                 else:
                     loss_cycle = content_emb.new_zeros(())
 
+                # Speaker adversarial loss on content (GRL):
+                # Forces content_emb to NOT encode speaker identity.
+                # The gradient reversal layer inverts gradients so the content
+                # encoder is trained to make speaker classification impossible.
+                if args.lambda_speaker_adv > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
+                    loss_speaker_adv = unwrapped_model.disentangle.speaker_adversarial_loss(
+                        content_emb, grl_lambda=dis_ramp
+                    )
+                else:
+                    loss_speaker_adv = content_emb.new_zeros(())
+
+                # VC mel verification loss:
+                # Decodes swapped-speaker hidden through the full decoder,
+                # then compares time-averaged mel spectra with the target
+                # speaker's audio. This is the "cloning discriminator" —
+                # it verifies speaker transfer at the waveform level.
+                # Only computed every vc_mel_every steps to save VRAM.
+                compute_vc_mel = (
+                    args.lambda_vc_mel > 0
+                    and pred.shape[0] >= 2
+                    and dis_ramp > 0
+                    and global_step % args.vc_mel_every == 0
+                )
+                if compute_vc_mel:
+                    # Reuse the swap permutation from cycle loss (or create one)
+                    if args.lambda_cycle <= 0 or pred.shape[0] < 2:
+                        B = speaker_global.shape[0]
+                        perm = torch.randperm(B, device=speaker_global.device)
+                        swapped_speaker = speaker_global[perm]
+                        swapped_contrib = unwrapped_model.disentangle.decode_speaker(
+                            swapped_speaker, content_emb.shape[1]
+                        )
+                        swapped_combined = swapped_contrib + content_emb.detach()
+
+                    # Decode swapped hidden → waveform (gradients flow to disentangle)
+                    vc_wav = unwrapped_model.decode_hidden(swapped_combined)
+
+                    # Target speaker's original audio (permuted to match swap)
+                    target_spk_wav = target[perm]
+
+                    # Align lengths
+                    vc_min_len = min(vc_wav.shape[-1], target_spk_wav.shape[-1])
+                    vc_wav = vc_wav[..., :vc_min_len]
+                    target_spk_wav = target_spk_wav[..., :vc_min_len]
+
+                    # Time-averaged mel comparison (captures speaker formants/timbre)
+                    # Content averages out; what remains is speaker-specific spectral shape.
+                    # Use the largest mel transform (320 mels, 2048 window) for best
+                    # speaker frequency resolution.
+                    mel_fn = multi_res_mel_loss_fn.mel_transforms[-1]  # 320 mels
+                    vc_mel = mel_fn(vc_wav).clamp(1e-5).log10()       # [B, 320, T']
+                    tgt_mel = mel_fn(target_spk_wav.detach()).clamp(1e-5).log10()
+                    # Mean across time → speaker spectral profile
+                    vc_mel_mean = vc_mel.mean(dim=-1)    # [B, 320]
+                    tgt_mel_mean = tgt_mel.mean(dim=-1)  # [B, 320]
+                    loss_vc_mel = torch.nn.functional.l1_loss(vc_mel_mean, tgt_mel_mean)
+                else:
+                    loss_vc_mel = content_emb.new_zeros(())
+
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
@@ -1467,6 +1586,8 @@ def main():
                     + args.lambda_consistency * loss_consistency
                     + dis_ramp * args.lambda_speaker_id * loss_speaker_id
                     + dis_ramp * args.lambda_cycle * loss_cycle
+                    + dis_ramp * args.lambda_speaker_adv * loss_speaker_adv
+                    + dis_ramp * args.lambda_vc_mel * loss_vc_mel
                 )
 
                 # =====================
@@ -1556,6 +1677,8 @@ def main():
                         "g/loss_consistency": loss_consistency.item(),
                         "g/loss_speaker_id": loss_speaker_id.item(),
                         "g/loss_cycle": loss_cycle.item(),
+                        "g/loss_speaker_adv": loss_speaker_adv.item(),
+                        "g/loss_vc_mel": loss_vc_mel.item(),
                         "g/dis_ramp": dis_ramp,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],

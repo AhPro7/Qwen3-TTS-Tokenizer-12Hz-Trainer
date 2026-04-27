@@ -105,7 +105,10 @@ class QwenEvaluator(EvaluatorBase):
                 self.decoder.load_state_dict(load_file(str(dec_path)), strict=False)
             
             speaker_dim = cfg.get("speaker_dim", 256)
-            self.disentangle = DisentangledProjection(1024, speaker_dim).to(self.device).to(self.dtype)
+            content_bottleneck_dim = cfg.get("content_bottleneck_dim", 128)
+            self.disentangle = DisentangledProjection(
+                1024, speaker_dim, content_bottleneck_dim
+            ).to(self.device).to(self.dtype)
             if dis_path.exists():
                 self.disentangle.load_state_dict(load_file(str(dis_path)))
             self.disentangle.eval()
