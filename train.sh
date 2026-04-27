@@ -30,7 +30,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     \
-    --batch_size 2 \
+    --batch_size 4 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \

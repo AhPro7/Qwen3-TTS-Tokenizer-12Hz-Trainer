@@ -182,7 +182,7 @@ def parse_args():
     parser.add_argument(
         "--add_48k_decoder_block",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Append extra_upsample_rate to upsample_rates to target 48kHz. Use --no-add_48k_decoder_block to fine-tune the base 24kHz decoder.",
     )
     parser.add_argument(
@@ -611,17 +611,27 @@ def create_model(args, accelerator):
             for param in decoder.decoder[i].parameters():
                 param.requires_grad = True
 
-    trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in decoder.parameters())
+    trainable_decoder = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
+    total_decoder = sum(p.numel() for p in decoder.parameters())
     accelerator.print(
-        f"Generator trainable: {trainable_params:,} / {total_params:,} "
-        f"({trainable_params / total_params * 100:.4f}%)"
+        f"Decoder trainable: {trainable_decoder:,} / {total_decoder:,} "
+        f"({trainable_decoder / total_decoder * 100:.4f}%)"
     )
 
     wrapper = DecoderTrainingWrapper(
         decoder, num_frozen,
         train_full_decoder=args.train_full_decoder,
         speaker_dim=args.speaker_dim,
+    )
+
+    # DisentangledProjection is always trainable
+    dis_params = sum(p.numel() for p in wrapper.disentangle.parameters())
+    total_trainable = trainable_decoder + dis_params
+    accelerator.print(
+        f"DisentangledProjection: {dis_params:,} params (all trainable)"
+    )
+    accelerator.print(
+        f"Total trainable: {total_trainable:,} (decoder: {trainable_decoder:,} + disentangle: {dis_params:,})"
     )
 
     # Load weights from checkpoint
