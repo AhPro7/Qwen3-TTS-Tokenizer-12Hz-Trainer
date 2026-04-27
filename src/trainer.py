@@ -583,17 +583,19 @@ class DecoderTrainingWrapper(nn.Module):
         space, decode to waveform, then verify speaker identity at audio level.
         Gradients flow back to DisentangledProjection through the frozen decoder.
         """
-        # Match decoder weight dtype (bf16) — input may be float32 from detach/GRL
-        dec_dtype = next(self.decoder.parameters()).dtype
-        hidden = hidden.to(dec_dtype)
-        x = hidden.permute(0, 2, 1)
-        for blocks in self.decoder.upsample:
-            for block in blocks:
-                x = block(x)
-        wav = x
-        for block in self.decoder.decoder:
-            wav = block(wav)
-        return wav.clamp(min=-1, max=1).squeeze(1)
+        # Force bf16 throughout — autocast lets some intermediate ops drift
+        # to float32 which causes conv_transpose1d dtype mismatch.
+        device_type = "cuda" if hidden.is_cuda else "cpu"
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+            hidden = hidden.to(torch.bfloat16)
+            x = hidden.permute(0, 2, 1)
+            for blocks in self.decoder.upsample:
+                for block in blocks:
+                    x = block(x)
+            wav = x
+            for block in self.decoder.decoder:
+                wav = block(wav)
+            return wav.clamp(min=-1, max=1).squeeze(1)
 
 
 def create_model(args, accelerator):
