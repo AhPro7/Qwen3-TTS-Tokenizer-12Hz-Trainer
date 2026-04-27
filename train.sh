@@ -29,7 +29,6 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
-    --resume_from  "${OUTPUT_DIR}/run18/checkpoint-step-218750" \
     \
     --batch_size 2 \
     --gradient_accumulation_steps 2 \
@@ -66,7 +65,6 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
-    --no_resume_optimizer \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
     --wandb_run_name "Run${RUN_NUMBER}-GradFlowFix"
