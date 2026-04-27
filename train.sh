@@ -8,20 +8,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=84
+RUN_NUMBER=86
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Runs 82-83 failed: content bottleneck destroyed reconstruction quality,
-# causing instant GAN collapse (D dominates before G can recover).
+# Run 84 mel stuck at 7-8 despite 2000 steps of reconstruction-only training.
 #
-# Fix: --gan_start_step 2000
-#   Phase 1 (steps 0-2000): reconstruction-only (mel + RMS + disentanglement)
-#     Content bottleneck learns to reconstruct. No GAN interference.
-#   Phase 2 (steps 2000+): GAN activates with fresh discriminator.
-#     Generator already produces decent audio → D can't trivially dominate.
+# ROOT CAUSE: When resuming from Run 81 with strict=False, the old
+# speaker_decoder weights (near-zero, because Run 81 never needed the speaker
+# path) were loaded and overwrote the fresh Xavier init. This killed the
+# speaker path — it couldn't contribute to reconstruction, so the content
+# bottleneck (256-dim) had to carry EVERYTHING alone. Not enough capacity.
 #
-# Resume from Run 81 decoder weights (good reconstruction baseline).
-# Fresh discriminator + fresh optimizer (new architecture).
+# Fixes:
+#   --no_resume_disentangle: fresh DisentangledProjection with non-zero
+#     speaker_decoder (Xavier gain=0.5). Both paths contribute from step 0.
+#   --content_bottleneck_dim 512: wider bottleneck (50% retention).
+#     256-dim was too tight — mel plateaued at ~7.
+#   --gan_start_step 3000: longer reconstruction pre-training.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -32,6 +35,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --resume_from  "${OUTPUT_DIR}/run81/checkpoint-step-1000" \
     --no_resume_optimizer \
     --no_resume_discriminator \
+    --no_resume_disentangle \
     \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -52,7 +56,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --save_every 500 \
     --eval_every 100 \
     --log_every 5 \
-    --gan_start_step 2000 \
+    --gan_start_step 3000 \
     \
     --lambda_adv           0.3  \
     --lambda_fm            3.0  \
@@ -67,14 +71,14 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_speaker_adv   0.5  \
     --lambda_vc_mel        1.0  \
     --vc_mel_every         5    \
-    --disentangle_warmup_steps 1000 \
+    --disentangle_warmup_steps 1500 \
     \
-    --content_bottleneck_dim 256 \
+    --content_bottleneck_dim 512 \
     \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-GanDelay2K-Bottleneck256"
+    --wandb_run_name "Run${RUN_NUMBER}-FreshDisentangle-BN512"
 

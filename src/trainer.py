@@ -220,6 +220,17 @@ def parse_args():
             "and the old discriminator would dominate the new generator."
         ),
     )
+    parser.add_argument(
+        "--no_resume_disentangle",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Do not resume DisentangledProjection weights when resuming from a "
+            "checkpoint. CRITICAL when architecture changed (e.g. adding content "
+            "bottleneck): the old speaker_decoder was near-zero (never needed) "
+            "and overwrites the fresh Xavier init, killing the speaker path."
+        ),
+    )
 
     # Training settings
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
@@ -735,14 +746,28 @@ def create_model(args, accelerator):
                 f"WARNING: decoder_block.safetensors not found at {checkpoint_path}"
             )
 
-        # Load DisentangledProjection weights (critical fix: was missing before)
+        # Load DisentangledProjection weights (skip if architecture changed)
         dis_path = Path(args.resume_from) / "disentangle.safetensors"
-        if dis_path.exists():
+        if args.no_resume_disentangle:
+            accelerator.print(
+                "Skipping DisentangledProjection resume (--no_resume_disentangle). "
+                "Using fresh warm-start init — speaker_decoder is non-zero."
+            )
+        elif dis_path.exists():
             accelerator.print(f"Loading DisentangledProjection from {dis_path}...")
             try:
                 dis_weights = load_file(str(dis_path))
-                wrapper.disentangle.load_state_dict(dis_weights, strict=False)
-                accelerator.print("DisentangledProjection weights loaded ✓")
+                missing, unexpected = wrapper.disentangle.load_state_dict(
+                    dis_weights, strict=False
+                )
+                accelerator.print(
+                    f"DisentangledProjection loaded: "
+                    f"{len(missing)} missing, {len(unexpected)} unexpected"
+                )
+                if missing:
+                    accelerator.print(f"  Missing (new arch): {missing[:5]}...")
+                if unexpected:
+                    accelerator.print(f"  Unexpected (old arch): {unexpected[:5]}...")
             except Exception as e:
                 accelerator.print(
                     f"WARNING: DisentangledProjection load failed (architecture change?): {e}\n"
