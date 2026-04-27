@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=80
+RUN_NUMBER=81
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 1: Reconstruction + Disentanglement (NO GAN)
@@ -46,7 +46,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --no-use_gan \
     --train_full_decoder \
-    --batch_size 2 \
+    --batch_size 4 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
