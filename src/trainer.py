@@ -1677,7 +1677,10 @@ def main():
                                 for idx in unique_indices:
                                     h = _to_hidden(sample_codes[idx:idx+1])
                                     hidden_cache[idx] = h
-                                    recon_cache[idx] = _decode_hidden(h)
+                                    # Pass through DisentangledProjection (same as training path)
+                                    spk_c, cnt_c, _ = dis(h)
+                                    recon_hidden = spk_c + cnt_c
+                                    recon_cache[idx] = _decode_hidden(recon_hidden)
 
                                 for src_i, tgt_i in vc_pairs[:3]:
                                     try:
