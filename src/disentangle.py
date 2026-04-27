@@ -215,6 +215,7 @@ class DisentangledProjection(nn.Module):
 
         # GRL: forward = identity, backward = negate
         content_reversed = grad_reverse(content_emb, grl_lambda)
+        content_reversed = self._match_dtype(content_reversed)
         speaker_repr = self.speaker_adversarial(content_reversed)  # [B, proj_dim]
 
         # In-batch contrastive: all samples should look the same (no speaker info)
