@@ -44,50 +44,8 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 TOKENIZER_SR = 24_000
 
 
-# ── DisentangledProjection (must match trainer.py) ──────────────────────────
-class DisentangledProjection(nn.Module):
-    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.speaker_dim = speaker_dim
-        self.speaker_encoder = nn.Sequential(
-            nn.Linear(hidden_dim, speaker_dim), nn.ReLU(),
-        )
-        self.speaker_attention = nn.Linear(speaker_dim, 1)
-        self.speaker_decoder = nn.Linear(speaker_dim, hidden_dim)
-        self.content_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self._warm_start_init()
-
-    def _warm_start_init(self):
-        for layer in self.content_proj:
-            if isinstance(layer, nn.Linear):
-                nn.init.eye_(layer.weight)
-                nn.init.zeros_(layer.bias)
-                with torch.no_grad():
-                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
-        nn.init.uniform_(self.speaker_decoder.weight, -1e-3, 1e-3)
-        nn.init.zeros_(self.speaker_decoder.bias)
-
-    def encode_speaker(self, x):
-        h = self.speaker_encoder(x)
-        attn = torch.softmax(self.speaker_attention(h), dim=1)
-        return (h * attn).sum(dim=1)
-
-    def decode_speaker(self, speaker_global, seq_len):
-        out = self.speaker_decoder(speaker_global)
-        return out.unsqueeze(1).expand(-1, seq_len, -1)
-
-    def encode_content(self, x):
-        return self.content_proj(x)
-
-    def forward(self, x):
-        speaker_global = self.encode_speaker(x)
-        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])
-        content_emb = self.encode_content(x)
-        return speaker_contribution, content_emb, speaker_global
+# ── DisentangledProjection (shared module) ──────────────────────────────────
+from disentangle import DisentangledProjection
 
 
 # ── Model Loader ────────────────────────────────────────────────────────────
@@ -143,7 +101,8 @@ class ModelEvaluator:
             )
 
         # Load DisentangledProjection
-        self.disentangle = DisentangledProjection(1024, 256).to(self.device).to(self.dtype)
+        speaker_dim = self.config.get("speaker_dim", 256)
+        self.disentangle = DisentangledProjection(1024, speaker_dim).to(self.device).to(self.dtype)
         self.has_disentangle = False
         if not self.is_original:
             dis_path = self.checkpoint_path / "disentangle.safetensors"

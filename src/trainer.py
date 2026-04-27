@@ -87,88 +87,7 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Decoder,
 )
 
-class DisentangledProjection(nn.Module):
-    """AutoVC-style information bottleneck for speaker/content disentanglement.
-
-    Speaker path: Linear → ReLU → attention pool across time → global vector
-                  → Linear back to hidden_dim → broadcast to all frames.
-    The temporal pooling makes it structurally impossible to encode per-frame
-    content, forcing the content path to carry that information instead.
-
-    Content path: per-frame 2-layer MLP (keeps temporal detail).
-    """
-
-    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.speaker_dim = speaker_dim
-
-        # Speaker branch: encode → pool → decode
-        self.speaker_encoder = nn.Sequential(
-            nn.Linear(hidden_dim, speaker_dim),
-            nn.ReLU(),
-        )
-        self.speaker_attention = nn.Linear(speaker_dim, 1)  # attention weights
-        self.speaker_decoder = nn.Linear(speaker_dim, hidden_dim)
-
-        # Content branch: per-frame MLP
-        self.content_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self._warm_start_init()
-
-    def _warm_start_init(self):
-        """Warm-start so combined = speaker_contrib + content_emb ≈ x at step 0.
-
-        Strategy:
-          - content_proj layers → near-identity  (content_emb ≈ x)
-          - speaker_decoder   → near-zero        (speaker_contrib ≈ 0)
-        Result: combined ≈ 0 + x = x  → decoder hears the same signal it was
-        trained on → clean audio from step 0, no 'copper mic' artifacts.
-        Disentanglement emerges gradually through training.
-        """
-        # Content path: near-identity init
-        for layer in self.content_proj:
-            if isinstance(layer, nn.Linear):
-                nn.init.eye_(layer.weight)      # identity
-                nn.init.zeros_(layer.bias)
-                # tiny noise to break symmetry
-                with torch.no_grad():
-                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
-
-        # Speaker decoder: near-zero so speaker_contrib ≈ 0 at init
-        nn.init.uniform_(self.speaker_decoder.weight, -1e-3, 1e-3)
-        nn.init.zeros_(self.speaker_decoder.bias)
-
-    def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, hidden_dim] → speaker_global: [B, speaker_dim]"""
-        h = self.speaker_encoder(x)                                 # [B, T, speaker_dim]
-        attn = torch.softmax(self.speaker_attention(h), dim=1)      # [B, T, 1]
-        return (h * attn).sum(dim=1)                                # [B, speaker_dim]
-
-    def decode_speaker(self, speaker_global: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """speaker_global: [B, speaker_dim] → [B, T, hidden_dim]"""
-        out = self.speaker_decoder(speaker_global)                  # [B, hidden_dim]
-        return out.unsqueeze(1).expand(-1, seq_len, -1)             # [B, T, hidden_dim]
-
-    def encode_content(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, hidden_dim] → content_emb: [B, T, hidden_dim]"""
-        return self.content_proj(x)
-
-    def forward(self, x: torch.Tensor):
-        """Returns (speaker_contribution, content_emb, speaker_global).
-
-        speaker_contribution: [B, T, hidden_dim]  (broadcast from global)
-        content_emb:          [B, T, hidden_dim]  (per-frame)
-        speaker_global:       [B, speaker_dim]    (for logging / swap)
-        """
-        speaker_global = self.encode_speaker(x)                       # [B, speaker_dim]
-        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])  # [B, T, H]
-        content_emb = self.encode_content(x)                          # [B, T, H]
-        return speaker_contribution, content_emb, speaker_global
+from disentangle import DisentangledProjection
 
 BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
 
@@ -380,19 +299,46 @@ def parse_args():
     parser.add_argument(
         "--lambda_orth",
         type=float,
-        default=0.1,
-        help="Orthogonality cosine loss weight",
+        default=0.5,
+        help="Orthogonality cosine loss weight (speaker ⊥ content)",
     )
     parser.add_argument(
         "--lambda_consistency",
         type=float,
+        default=0.0,
+        help=(
+            "Content consistency loss weight: MSE(content_emb, original_hidden). "
+            "Penalizes the content path from deviating too far. "
+            "0 disables (recommended — warm-start init provides the same benefit). "
+        ),
+    )
+    parser.add_argument(
+        "--lambda_speaker_id",
+        type=float,
         default=1.0,
         help=(
-            "Hidden consistency loss weight: MSE(speaker+content, original_hidden). "
-            "Penalizes DisentangledProjection from distorting the hidden state, "
-            "eliminating copper-mic artifacts. Naturally decays as model learns. "
-            "0 disables. Recommended: 1.0 early, then reduce to 0.1 after ~5k steps."
+            "Speaker identity preservation loss weight. "
+            "Re-extracts speaker embedding from the combined hidden and ensures "
+            "it matches the original speaker global vector. 0 disables."
         ),
+    )
+    parser.add_argument(
+        "--lambda_cycle",
+        type=float,
+        default=0.5,
+        help=(
+            "In-batch speaker swap cycle consistency loss weight. "
+            "Swaps speakers within a batch, re-extracts, and ensures consistency. "
+            "Trains the model to handle voice conversion during training. 0 disables."
+        ),
+    )
+
+    # Architecture
+    parser.add_argument(
+        "--speaker_dim",
+        type=int,
+        default=256,
+        help="Speaker bottleneck dimension in DisentangledProjection (default: 256)",
     )
 
     # Data settings
@@ -484,6 +430,7 @@ class DecoderTrainingWrapper(nn.Module):
         decoder: Qwen3TTSTokenizerV2Decoder,
         num_frozen_decoder_modules: int,
         train_full_decoder: bool = False,
+        speaker_dim: int = 256,
     ):
         super().__init__()
         self.decoder = decoder
@@ -491,7 +438,7 @@ class DecoderTrainingWrapper(nn.Module):
         self.train_full_decoder = train_full_decoder
         
         hidden_dim = 1024  # actual output dim of pre_transformer
-        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=256)
+        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=speaker_dim)
         self.last_content_emb = None
         self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
         self.last_speaker_global = None  # [B, speaker_dim] for logging
@@ -641,14 +588,14 @@ def create_model(args, accelerator):
     )
 
     wrapper = DecoderTrainingWrapper(
-        decoder, num_frozen, train_full_decoder=args.train_full_decoder
+        decoder, num_frozen,
+        train_full_decoder=args.train_full_decoder,
+        speaker_dim=args.speaker_dim,
     )
 
-    hidden_dim = 1024  # actual output dim of pre_transformer
-    wrapper.disentangle = DisentangledProjection(hidden_dim, speaker_dim=256).to(torch.bfloat16)
-
-    # Load generator weights from checkpoint
+    # Load weights from checkpoint
     if args.resume_from:
+        # Load decoder weights
         checkpoint_path = Path(args.resume_from) / "decoder_block.safetensors"
         if checkpoint_path.exists():
             accelerator.print(f"Loading generator weights from {checkpoint_path}...")
@@ -661,6 +608,25 @@ def create_model(args, accelerator):
         else:
             accelerator.print(
                 f"WARNING: decoder_block.safetensors not found at {checkpoint_path}"
+            )
+
+        # Load DisentangledProjection weights (critical fix: was missing before)
+        dis_path = Path(args.resume_from) / "disentangle.safetensors"
+        if dis_path.exists():
+            accelerator.print(f"Loading DisentangledProjection from {dis_path}...")
+            try:
+                dis_weights = load_file(str(dis_path))
+                wrapper.disentangle.load_state_dict(dis_weights, strict=False)
+                accelerator.print("DisentangledProjection weights loaded ✓")
+            except Exception as e:
+                accelerator.print(
+                    f"WARNING: DisentangledProjection load failed (architecture change?): {e}\n"
+                    f"Starting DisentangledProjection from warm-start init."
+                )
+        else:
+            accelerator.print(
+                "WARNING: disentangle.safetensors not found — "
+                "starting DisentangledProjection from warm-start init."
             )
 
     return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
@@ -893,6 +859,7 @@ def save_checkpoint(
         "use_gan": args.use_gan,
         "add_48k_decoder_block": args.add_48k_decoder_block,
         "train_full_decoder": args.train_full_decoder,
+        "speaker_dim": args.speaker_dim,
         "step": step,
         "epoch": epoch,
         "training_type": "gan" if args.use_gan else "reconstruction",
@@ -903,6 +870,8 @@ def save_checkpoint(
         "lambda_multi_res_mel": args.lambda_multi_res_mel,
         "lambda_global_rms": args.lambda_global_rms,
         "lambda_orth": args.lambda_orth,
+        "lambda_speaker_id": args.lambda_speaker_id,
+        "lambda_cycle": args.lambda_cycle,
         "beta1_g": args.beta1_g,
         "beta2_g": args.beta2_g,
         "beta1_d": args.beta1_d,
@@ -1377,27 +1346,63 @@ def main():
                 else:
                     loss_global_rms = pred.new_zeros(())
 
-                # Total generator loss
+                # =====================
+                # Disentanglement losses
+                # =====================
                 unwrapped_model = accelerator.unwrap_model(model)
                 speaker_emb = unwrapped_model.last_speaker_emb
                 content_emb = unwrapped_model.last_content_emb
+                speaker_global = unwrapped_model.last_speaker_global
+                original_hidden = unwrapped_model.last_original_hidden
                 
+                # Orthogonality: speaker ⊥ content
                 loss_ortho = torch.nn.functional.cosine_similarity(
                     speaker_emb, content_emb, dim=-1
                 ).abs().mean()
                 
-                # Hidden consistency loss: MSE(combined, original_pre_transformer_output)
-                # Penalizes the disentangled sum from deviating from the natural
-                # hidden distribution, preventing 'copper mic' noise artifacts.
-                # Starts near 0 with warm-start init and decays naturally over training.
+                # Content consistency: MSE(content_emb, original_hidden)
+                # Only constrains the content path (not the combined sum),
+                # allowing the speaker path to freely add new information.
                 if args.lambda_consistency > 0:
-                    original_hidden = unwrapped_model.last_original_hidden
-                    combined_hidden = unwrapped_model.last_speaker_emb + unwrapped_model.last_content_emb
                     loss_consistency = torch.nn.functional.mse_loss(
-                        combined_hidden, original_hidden
+                        content_emb, original_hidden
                     )
                 else:
-                    loss_consistency = speaker_emb.new_zeros(())
+                    loss_consistency = content_emb.new_zeros(())
+
+                # Speaker identity preservation: re-extract speaker from
+                # combined hidden and ensure it matches the original.
+                # This gives a direct gradient signal for voice preservation.
+                if args.lambda_speaker_id > 0:
+                    combined_hidden = speaker_emb + content_emb
+                    re_speaker = unwrapped_model.disentangle.encode_speaker(
+                        combined_hidden
+                    )
+                    loss_speaker_id = 1.0 - torch.nn.functional.cosine_similarity(
+                        re_speaker, speaker_global.detach(), dim=-1
+                    ).mean()
+                else:
+                    loss_speaker_id = content_emb.new_zeros(())
+
+                # In-batch speaker swap cycle consistency:
+                # Swap speakers within the batch, re-extract, ensure match.
+                # Trains the model to handle voice conversion during training.
+                if args.lambda_cycle > 0 and pred.shape[0] >= 2:
+                    B = speaker_global.shape[0]
+                    perm = torch.randperm(B, device=speaker_global.device)
+                    swapped_speaker = speaker_global[perm]
+                    swapped_contrib = unwrapped_model.disentangle.decode_speaker(
+                        swapped_speaker, content_emb.shape[1]
+                    )
+                    swapped_combined = swapped_contrib + content_emb.detach()
+                    re_swapped = unwrapped_model.disentangle.encode_speaker(
+                        swapped_combined
+                    )
+                    loss_cycle = 1.0 - torch.nn.functional.cosine_similarity(
+                        re_swapped, swapped_speaker.detach(), dim=-1
+                    ).mean()
+                else:
+                    loss_cycle = content_emb.new_zeros(())
 
                 loss_g = (
                     args.lambda_adv * loss_g_adv
@@ -1406,6 +1411,8 @@ def main():
                     + args.lambda_global_rms * loss_global_rms
                     + args.lambda_orth * loss_ortho
                     + args.lambda_consistency * loss_consistency
+                    + args.lambda_speaker_id * loss_speaker_id
+                    + args.lambda_cycle * loss_cycle
                 )
 
                 # Per-component gradient norms (only on log steps)
@@ -1464,6 +1471,8 @@ def main():
                         "g/loss_global_rms": loss_global_rms.item(),
                         "g/loss_ortho": loss_ortho.item(),
                         "g/loss_consistency": loss_consistency.item(),
+                        "g/loss_speaker_id": loss_speaker_id.item(),
+                        "g/loss_cycle": loss_cycle.item(),
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
@@ -1523,7 +1532,14 @@ def main():
                     )
                     accelerator.log(val_losses, step=global_step)
 
-                    # Log audio samples to W&B
+                    # Log Voice Conversion Table to W&B
+                    # 5-column table (all audio):
+                    #   1. Original Speaker Audio (ground truth)
+                    #   2. Original Speaker Reconstruction (model output)
+                    #   3. Target Speaker Audio (ground truth voice source)
+                    #   4. Target Speaker Reconstruction (model output)
+                    #   5. Converted Output (content from original + voice from target)
+                    # 3 rows of in-batch speaker swap demos
                     if accelerator.is_main_process:
                         try:
                             import wandb
@@ -1532,62 +1548,98 @@ def main():
                             sample_targets = sample_batch["audio"].float().cpu()
                             sample_sr = target_sample_rate
 
+                            unwrapped = accelerator.unwrap_model(model)
+                            dec = unwrapped.decoder
+                            dis = unwrapped.disentangle
+
+                            def _to_hidden(c):
+                                h = dec.quantizer.decode(c)
+                                h = dec.pre_conv(h).transpose(1, 2)
+                                return dec.pre_transformer(inputs_embeds=h).last_hidden_state
+
+                            def _decode_hidden(hidden):
+                                x = hidden.permute(0, 2, 1)
+                                for blocks in dec.upsample:
+                                    for block in blocks:
+                                        x = block(x)
+                                wav = x
+                                for block in dec.decoder:
+                                    wav = block(wav)
+                                return wav.clamp(-1, 1).squeeze().float().cpu().numpy()
+
+                            # Build voice conversion pairs: (src_idx, tgt_idx)
+                            B = sample_codes.shape[0]
+                            vc_pairs = []
+                            if B >= 2:
+                                vc_pairs.append((0, 1))
+                            if B >= 3:
+                                vc_pairs.append((1, 2))
+                                vc_pairs.append((0, 2))
+                            elif B >= 2:
+                                vc_pairs.append((1, 0))
+                            # Ensure exactly 3 rows
+                            while len(vc_pairs) < 3 and len(vc_pairs) > 0:
+                                vc_pairs.append(vc_pairs[0])
+
+                            # Build W&B Table (all audio columns)
+                            vc_table = wandb.Table(columns=[
+                                "Original Speaker Audio",
+                                "Original Speaker Reconstruction",
+                                "Target Speaker Audio",
+                                "Target Speaker Reconstruction",
+                                "Converted Output",
+                            ])
+
                             with torch.inference_mode():
-                                sample_preds = accelerator.unwrap_model(model)(sample_codes)
+                                # Pre-compute reconstructions for each unique sample index
+                                unique_indices = sorted(set(
+                                    idx for pair in vc_pairs[:3] for idx in pair
+                                ))
+                                recon_cache = {}
+                                hidden_cache = {}
+                                for idx in unique_indices:
+                                    h = _to_hidden(sample_codes[idx:idx+1])
+                                    hidden_cache[idx] = h
+                                    recon_cache[idx] = _decode_hidden(h)
 
-                            # Log up to 4 reconstruction pairs
-                            n_log = min(4, sample_codes.shape[0])
-                            audio_log = {}
-                            for i in range(n_log):
-                                pred_np = sample_preds[i].squeeze().float().cpu().numpy()
-                                tgt_np  = sample_targets[i].numpy()
-                                audio_log[f"audio/sample{i+1}_pred"]   = wandb.Audio(pred_np, sample_rate=sample_sr, caption=f"step{global_step} pred#{i+1}")
-                                audio_log[f"audio/sample{i+1}_target"] = wandb.Audio(tgt_np,  sample_rate=sample_sr, caption=f"step{global_step} target#{i+1}")
+                                for src_i, tgt_i in vc_pairs[:3]:
+                                    try:
+                                        # Ground truth audio
+                                        src_gt_np = sample_targets[src_i].numpy()
+                                        tgt_gt_np = sample_targets[tgt_i].numpy()
 
-                            # Voice conversion demo: swap speaker[1] into content[0]
-                            if sample_codes.shape[0] >= 2:
-                                try:
-                                    unwrapped = accelerator.unwrap_model(model)
-                                    with torch.inference_mode():
-                                        # Get hidden states for sample 0 and 1
-                                        codes_0 = sample_codes[0:1]
-                                        codes_1 = sample_codes[1:2]
-                                        decoder = unwrapped.decoder
+                                        # Reconstructed audio (model output)
+                                        src_recon_np = recon_cache[src_i]
+                                        tgt_recon_np = recon_cache[tgt_i]
 
-                                        def _to_hidden(c):
-                                            h = decoder.quantizer.decode(c)
-                                            h = decoder.pre_conv(h).transpose(1, 2)
-                                            h = decoder.pre_transformer(inputs_embeds=h).last_hidden_state
-                                            return h
+                                        # Voice conversion: content[src] + speaker[tgt]
+                                        content_src = dis.encode_content(hidden_cache[src_i])
+                                        speaker_tgt = dis.encode_speaker(hidden_cache[tgt_i])
+                                        speaker_tgt_contrib = dis.decode_speaker(
+                                            speaker_tgt, content_src.shape[1]
+                                        )
+                                        combined = speaker_tgt_contrib + content_src
+                                        vc_np = _decode_hidden(combined)
 
-                                        hidden_0 = _to_hidden(codes_0)
-                                        hidden_1 = _to_hidden(codes_1)
+                                        vc_table.add_data(
+                                            wandb.Audio(src_gt_np, sample_rate=sample_sr,
+                                                        caption=f"Original #{src_i}"),
+                                            wandb.Audio(src_recon_np, sample_rate=sample_sr,
+                                                        caption=f"Recon #{src_i}"),
+                                            wandb.Audio(tgt_gt_np, sample_rate=sample_sr,
+                                                        caption=f"Target #{tgt_i}"),
+                                            wandb.Audio(tgt_recon_np, sample_rate=sample_sr,
+                                                        caption=f"Recon #{tgt_i}"),
+                                            wandb.Audio(vc_np, sample_rate=sample_sr,
+                                                        caption=f"VC: content[{src_i}]+speaker[{tgt_i}]"),
+                                        )
+                                    except Exception as row_e:
+                                        accelerator.print(f"VC table row failed: {row_e}")
 
-                                        # Disentangle
-                                        content_0 = unwrapped.disentangle.encode_content(hidden_0)
-                                        speaker_1 = unwrapped.disentangle.encode_speaker(hidden_1)
-                                        speaker_1_contrib = unwrapped.disentangle.decode_speaker(speaker_1, content_0.shape[1])
-
-                                        combined = speaker_1_contrib + content_0  # [1, T, H]
-
-                                        # Decode combined
-                                        x = combined.permute(0, 2, 1)
-                                        for blocks in decoder.upsample:
-                                            for block in blocks:
-                                                x = block(x)
-                                        wav = x
-                                        for block in decoder.decoder:
-                                            wav = block(wav)
-                                        vc_np = wav.clamp(-1, 1).squeeze().float().cpu().numpy()
-
-                                    audio_log["audio/voice_convert_0to1"] = wandb.Audio(
-                                        vc_np, sample_rate=sample_sr,
-                                        caption=f"step{global_step} VC: content[0]+speaker[1]"
-                                    )
-                                except Exception as vc_e:
-                                    accelerator.print(f"VC audio logging failed: {vc_e}")
-
-                            accelerator.log(audio_log, step=global_step)
+                            accelerator.log(
+                                {"voice_conversion_table": vc_table},
+                                step=global_step,
+                            )
                         except Exception as e:
                             accelerator.print(f"Audio logging failed: {e}")
 

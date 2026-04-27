@@ -44,33 +44,7 @@ QWEN_SR = 24000
 # ==============================================================================
 # Qwen Custom Components
 # ==============================================================================
-class DisentangledProjection(nn.Module):
-    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
-        super().__init__()
-        self.speaker_encoder = nn.Sequential(nn.Linear(hidden_dim, speaker_dim), nn.ReLU())
-        self.speaker_attention = nn.Linear(speaker_dim, 1)
-        self.speaker_decoder = nn.Linear(speaker_dim, hidden_dim)
-        self.content_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def encode_speaker(self, x):
-        h = self.speaker_encoder(x)
-        attn = torch.softmax(self.speaker_attention(h), dim=1)
-        return (h * attn).sum(dim=1)
-
-    def decode_speaker(self, speaker_global, seq_len):
-        out = self.speaker_decoder(speaker_global)
-        return out.unsqueeze(1).expand(-1, seq_len, -1)
-
-    def encode_content(self, x):
-        return self.content_proj(x)
-
-    def forward(self, x):
-        speaker_global = self.encode_speaker(x)
-        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])
-        content_emb = self.encode_content(x)
-        return speaker_contribution, content_emb, speaker_global
+from disentangle import DisentangledProjection
 
 
 # ==============================================================================
@@ -119,6 +93,7 @@ class QwenEvaluator(EvaluatorBase):
             
             # Check 48k config
             config_path = ckpt_path / "config.json"
+            cfg = {}
             if config_path.exists():
                 with open(config_path) as f:
                     cfg = json.load(f)
@@ -129,7 +104,8 @@ class QwenEvaluator(EvaluatorBase):
             if dec_path.exists():
                 self.decoder.load_state_dict(load_file(str(dec_path)), strict=False)
             
-            self.disentangle = DisentangledProjection(1024, 256).to(self.device).to(self.dtype)
+            speaker_dim = cfg.get("speaker_dim", 256)
+            self.disentangle = DisentangledProjection(1024, speaker_dim).to(self.device).to(self.dtype)
             if dis_path.exists():
                 self.disentangle.load_state_dict(load_file(str(dis_path)))
             self.disentangle.eval()

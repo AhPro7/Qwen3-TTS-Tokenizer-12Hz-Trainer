@@ -49,61 +49,9 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 TOKENIZER_SR = 24_000  # Hz, encoder input sample rate
 
 
-class DisentangledProjection(nn.Module):
-    """Must match the architecture in trainer.py exactly."""
 
-    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.speaker_dim = speaker_dim
+from disentangle import DisentangledProjection
 
-        # Speaker branch
-        self.speaker_encoder = nn.Sequential(
-            nn.Linear(hidden_dim, speaker_dim),
-            nn.ReLU(),
-        )
-        self.speaker_attention = nn.Linear(speaker_dim, 1)
-        self.speaker_decoder = nn.Linear(speaker_dim, hidden_dim)
-
-        # Content branch
-        self.content_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self._warm_start_init()
-
-    def _warm_start_init(self):
-        """Must match trainer.py exactly for checkpoint compatibility."""
-        for layer in self.content_proj:
-            if isinstance(layer, nn.Linear):
-                nn.init.eye_(layer.weight)
-                nn.init.zeros_(layer.bias)
-                with torch.no_grad():
-                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
-        nn.init.uniform_(self.speaker_decoder.weight, -1e-3, 1e-3)
-        nn.init.zeros_(self.speaker_decoder.bias)
-
-    def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, hidden_dim] → speaker_global: [B, speaker_dim]"""
-        h = self.speaker_encoder(x)
-        attn = torch.softmax(self.speaker_attention(h), dim=1)
-        return (h * attn).sum(dim=1)
-
-    def decode_speaker(self, speaker_global: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """speaker_global: [B, speaker_dim] → [B, T, hidden_dim]"""
-        out = self.speaker_decoder(speaker_global)
-        return out.unsqueeze(1).expand(-1, seq_len, -1)
-
-    def encode_content(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T, hidden_dim] → content_emb: [B, T, hidden_dim]"""
-        return self.content_proj(x)
-
-    def forward(self, x: torch.Tensor):
-        speaker_global = self.encode_speaker(x)
-        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])
-        content_emb = self.encode_content(x)
-        return speaker_contribution, content_emb, speaker_global
 
 
 class VoiceConverter:
@@ -174,6 +122,8 @@ class VoiceConverter:
         # Load DisentangledProjection
         hidden_dim = 1024
         speaker_dim = 256
+        if config_path.exists():
+            speaker_dim = ckpt_config.get("speaker_dim", 256)
         self.disentangle = DisentangledProjection(hidden_dim, speaker_dim).to(self.device).to(self.dtype)
 
         disentangle_path = checkpoint_path / "disentangle.safetensors"
