@@ -422,6 +422,22 @@ def parse_args():
             "Prevents GAN collapse by letting the model stabilize first."
         ),
     )
+    parser.add_argument(
+        "--spike_skip_threshold",
+        type=float,
+        default=3.0,
+        help=(
+            "Skip generator update when mel loss exceeds this multiple of the "
+            "running EMA. Protects against multi-speaker chunk poisoning. "
+            "0 disables spike detection."
+        ),
+    )
+    parser.add_argument(
+        "--spike_ema_decay",
+        type=float,
+        default=0.99,
+        help="EMA decay factor for mel loss running average (spike detection).",
+    )
 
     return parser.parse_args()
 
@@ -1204,6 +1220,8 @@ def main():
     gen_grad_norm = 0.0
     r1_loss_val = 0.0  # last computed R1 penalty (persists between reg steps)
     total_audio_sec = 0
+    spike_skipped = 0  # counter for skipped batches
+    mel_ema = None     # EMA of mel loss for spike detection
     for epoch in range(start_epoch, args.num_epochs):
         accelerator.print(f"\n{'=' * 50}")
         accelerator.print(f"Epoch {epoch + 1}/{args.num_epochs}")
@@ -1437,12 +1455,36 @@ def main():
                     + dis_ramp * args.lambda_cycle * loss_cycle
                 )
 
+                # =====================
+                # Spike detection: skip poisoned batches
+                # =====================
+                mel_val = loss_multi_res_mel.item()
+                skip_this_batch = False
+                if args.spike_skip_threshold > 0:
+                    if mel_ema is None:
+                        mel_ema = mel_val  # init on first batch
+                    else:
+                        if mel_val > args.spike_skip_threshold * mel_ema and global_step > 50:
+                            skip_this_batch = True
+                            spike_skipped += 1
+                            if accelerator.is_main_process:
+                                accelerator.print(
+                                    f"  ⚠ SPIKE SKIP step {global_step}: "
+                                    f"mel={mel_val:.2f} > {args.spike_skip_threshold}×EMA({mel_ema:.2f})="
+                                    f"{args.spike_skip_threshold * mel_ema:.2f}. "
+                                    f"Skipping G update. (total skipped: {spike_skipped})"
+                                )
+                        # Update EMA only on non-spiked batches
+                        if not skip_this_batch:
+                            mel_ema = args.spike_ema_decay * mel_ema + (1 - args.spike_ema_decay) * mel_val
+
                 # Per-component gradient norms (only on log steps)
                 g_grad_norms = {}
                 should_log_grad = (
                     args.log_grad_norms
                     and accelerator.sync_gradients
                     and (global_step + 1) % args.log_every == 0
+                    and not skip_this_batch
                 )
                 if should_log_grad:
                     gen_params = [
@@ -1471,13 +1513,18 @@ def main():
                             )
                             g_grad_norms[gn_name] = total_norm.item()
 
-                optimizer_g.zero_grad()
-                accelerator.backward(loss_g)
-                if accelerator.sync_gradients:
-                    gen_grad_norm = compute_grad_norm(model)
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer_g.step()
-                scheduler_g.step()
+                if skip_this_batch:
+                    # Skip generator update — just zero grads and step scheduler
+                    optimizer_g.zero_grad()
+                    scheduler_g.step()
+                else:
+                    optimizer_g.zero_grad()
+                    accelerator.backward(loss_g)
+                    if accelerator.sync_gradients:
+                        gen_grad_norm = compute_grad_norm(model)
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer_g.step()
+                    scheduler_g.step()
 
             # Count/log/eval/save only on real optimizer sync steps.
             if accelerator.sync_gradients:
@@ -1500,6 +1547,9 @@ def main():
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
                         "train/total_audio_hour": total_audio_sec / 3600.0,
+                        "train/mel_ema": mel_ema if mel_ema is not None else 0.0,
+                        "train/spike_skipped_total": spike_skipped,
+                        "train/batch_skipped": 1.0 if skip_this_batch else 0.0,
                     }
                     log_dict.update(g_grad_norms)
                     if args.use_gan:
