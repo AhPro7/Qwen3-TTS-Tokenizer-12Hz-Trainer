@@ -122,13 +122,9 @@ class VoiceConverter:
         # Load DisentangledProjection
         hidden_dim = 1024
         speaker_dim = 256
-        content_bottleneck_dim = 128
         if config_path.exists():
             speaker_dim = ckpt_config.get("speaker_dim", 256)
-            content_bottleneck_dim = ckpt_config.get("content_bottleneck_dim", 128)
-        self.disentangle = DisentangledProjection(
-            hidden_dim, speaker_dim, content_bottleneck_dim
-        ).to(self.device).to(self.dtype)
+        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim).to(self.device).to(self.dtype)
 
         disentangle_path = checkpoint_path / "disentangle.safetensors"
         if disentangle_path.exists():
