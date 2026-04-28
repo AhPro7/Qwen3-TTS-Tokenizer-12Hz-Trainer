@@ -218,19 +218,23 @@ class DisentangledProjection(nn.Module):
         return loss
 
     def speaker_diversity_loss(
-        self, speaker_globals: torch.Tensor
+        self, speaker_globals: torch.Tensor, min_norm: float = 2.0
     ) -> torch.Tensor:
-        """Push in-batch speaker embeddings apart (contrastive).
+        """Push in-batch speaker embeddings apart AND prevent magnitude collapse.
 
-        The speaker encoder currently maps all speakers to cosine~0.95.
-        This loss penalizes high pairwise similarity, forcing the encoder
-        to produce DISTINCT embeddings for different speakers.
+        Two components:
+          1. Cosine diversity: penalize high pairwise cosine similarity.
+          2. Norm floor: penalize if ||speaker_global|| < min_norm.
+             Without this, the encoder collapses magnitude to near-zero
+             (cosine is scale-invariant, so small vectors satisfy diversity
+             while contributing nothing to the decoder).
 
         Args:
             speaker_globals: [B, speaker_dim] — speaker embeddings from batch.
+            min_norm: Minimum desired L2 norm for speaker embeddings.
 
         Returns:
-            Scalar loss. Higher = embeddings too similar.
+            Scalar loss.
         """
         speaker_globals = self._match_dtype(speaker_globals)
         normed = nn.functional.normalize(speaker_globals, dim=-1)
@@ -240,11 +244,15 @@ class DisentangledProjection(nn.Module):
         B = sim.size(0)
         mask = ~torch.eye(B, dtype=torch.bool, device=sim.device)
 
-        # Penalize high off-diagonal similarity
-        # Mean of squared off-diagonal similarities
-        loss = (sim[mask] ** 2).mean()
+        # 1. Cosine diversity: penalize high off-diagonal similarity
+        div_loss = (sim[mask] ** 2).mean()
 
-        return loss
+        # 2. Norm floor: penalize if embeddings collapse in magnitude
+        # ReLU(min_norm - ||x||) → 0 if norm >= min_norm, positive otherwise
+        norms = speaker_globals.norm(dim=-1)  # [B]
+        norm_loss = torch.relu(min_norm - norms).mean()
+
+        return div_loss + norm_loss
 
     def forward(self, x: torch.Tensor):
         """Returns (speaker_contribution, content_emb, speaker_global).

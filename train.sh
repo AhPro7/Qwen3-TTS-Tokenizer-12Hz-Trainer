@@ -27,7 +27,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     \
-    --batch_size 4 \
+    --batch_size 8 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
@@ -59,7 +59,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_cycle         0.5  \
     --lambda_speaker_adv   0.5  \
     --lambda_speaker_div   1.0  \
-    --content_dropout      0.1  \
+    --content_dropout      0.3  \
     --disentangle_warmup_steps 500 \
     \
     --spike_skip_threshold 3.0 \
