@@ -1490,15 +1490,9 @@ def main():
                 else:
                     loss_cycle = content_emb.new_zeros(())
 
-                # GRL adversarial: strip speaker info from content.
-                # The gradient reversal layer ensures the content encoder
-                # learns to make speaker classification IMPOSSIBLE.
-                if args.lambda_speaker_adv > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
-                    loss_speaker_adv = unwrapped_model.disentangle.speaker_adversarial_loss(
-                        content_emb, grl_lambda=dis_ramp
-                    )
-                else:
-                    loss_speaker_adv = content_emb.new_zeros(())
+                # GRL adversarial — disabled with residual formulation.
+                # Content structurally can't see speaker (subtracted + detached).
+                loss_speaker_adv = content_emb.new_zeros(())
 
                 # Speaker diversity: push in-batch speaker embeddings apart.
                 # Fixes the core problem: speaker encoder maps all speakers

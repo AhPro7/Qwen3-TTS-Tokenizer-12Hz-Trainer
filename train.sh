@@ -11,15 +11,18 @@ OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
 RUN_NUMBER=90
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Run 81 debug revealed the ROOT CAUSE of voice conversion failure:
-#   1. Speaker encoder maps all speakers to cosine~0.95 (can't distinguish!)
-#   2. Content carries everything (zero-speaker test sounds identical)
-#   3. Speaker path IS active (norm 1.4) but not speaker-specific
+# RESIDUAL DISENTANGLEMENT (from Run 81 debug):
 #
-# 3 targeted fixes (no bottleneck, no alpha blending):
-#   --lambda_speaker_adv 0.5  → GRL strips speaker info from content
-#   --lambda_speaker_div 1.0  → Contrastive pushes speaker embeddings apart
-#   --content_dropout    0.1  → Forces decoder to rely on speaker path
+# Problem: content carries everything, speaker encoder produces same
+# embedding for all speakers (cosine 0.95), voice conversion does nothing.
+#
+# Fix: content_proj sees (x - speaker_contrib.detach()), NOT raw x.
+# Content structurally CAN'T carry speaker info (it's subtracted + detached).
+# combined = speaker + content(x - speaker) = speaker + (x - speaker) = x
+# → perfect reconstruction regardless of speaker magnitude.
+#
+# Speaker decoder uses Xavier init (not near-zero) → starts with meaningful
+# contribution. Diversity + norm floor prevent collapse.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -57,9 +60,9 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    1.0  \
     --lambda_cycle         0.5  \
-    --lambda_speaker_adv   0.5  \
+    --lambda_speaker_adv   0.0  \
     --lambda_speaker_div   1.0  \
-    --content_dropout      0.3  \
+    --content_dropout      0.0  \
     --disentangle_warmup_steps 500 \
     \
     --spike_skip_threshold 3.0 \
@@ -67,4 +70,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-GRL-Diversity-Dropout"
+    --wandb_run_name "Run${RUN_NUMBER}-ResidualDisentangle"
