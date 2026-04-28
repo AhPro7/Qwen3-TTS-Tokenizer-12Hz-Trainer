@@ -335,29 +335,37 @@ def parse_args():
     parser.add_argument(
         "--lambda_speaker_adv",
         type=float,
-        default=0.5,
-        help=(
-            "GRL adversarial loss weight. Strips speaker info from content "
-            "via gradient reversal. Forces decoder to rely on speaker path. 0 disables."
-        ),
+        default=0.0,
+        help="(Deprecated) GRL adversarial loss weight. Set to 0.",
     )
     parser.add_argument(
         "--lambda_speaker_div",
         type=float,
-        default=1.0,
-        help=(
-            "Speaker diversity loss weight. Pushes in-batch speaker embeddings apart "
-            "(contrastive). Fixes the speaker_global A≈B problem (cosine 0.95). 0 disables."
-        ),
+        default=0.0,
+        help="(Deprecated) Speaker diversity loss weight. Set to 0.",
     )
     parser.add_argument(
         "--content_dropout",
         type=float,
-        default=0.1,
+        default=0.0,
+        help="(Deprecated) Content feature dropout. Set to 0.",
+    )
+    # kNN Prematched Training (the proven approach from kNN-VC paper)
+    parser.add_argument(
+        "--prematch_prob",
+        type=float,
+        default=0.5,
         help=(
-            "Content feature dropout rate during training. Forces decoder to rely on "
-            "speaker path for stable features. 0 disables."
+            "Probability of applying kNN self-prematching per batch sample. "
+            "0.5 = half clean, half matched. Teaches decoder to handle frame "
+            "substitution for voice conversion."
         ),
+    )
+    parser.add_argument(
+        "--prematch_k",
+        type=int,
+        default=4,
+        help="Number of nearest neighbors for self-prematching.",
     )
 
     # Architecture
@@ -471,12 +479,63 @@ def parse_args():
 
 
 
+def knn_self_prematch(hidden, k=4, prematch_prob=0.5):
+    """kNN self-prematching: replace frames with nearest neighbors from same utterance.
+
+    This is the key technique from the kNN-VC paper (Baas et al., 2023).
+    Teaches the decoder to handle frame-level feature substitution.
+    At inference, cross-speaker kNN matching produces clean output because
+    the decoder was trained on matched (not clean) features.
+
+    Args:
+        hidden: [B, T, D] hidden states from pre_transformer.
+        k: Number of nearest neighbors.
+        prematch_prob: Probability of prematching each sample (0.5 = half clean).
+
+    Returns:
+        Prematched hidden states [B, T, D].
+    """
+    B, T, D = hidden.shape
+    if T < k + 1:
+        return hidden  # too short for meaningful matching
+
+    matched = hidden.clone()
+    device = hidden.device
+
+    for b in range(B):
+        if torch.rand(1, device=device).item() > prematch_prob:
+            continue  # keep this sample clean
+
+        h = hidden[b]  # [T, D]
+        h_norm = torch.nn.functional.normalize(h, dim=-1)
+
+        # Cosine similarity [T, T]
+        sim = torch.mm(h_norm, h_norm.t())
+
+        # Don't match to self
+        sim.fill_diagonal_(-float('inf'))
+
+        # Top-k
+        actual_k = min(k, T - 1)
+        topk_sim, topk_idx = sim.topk(actual_k, dim=-1)  # [T, k]
+        weights = torch.nn.functional.softmax(topk_sim * 10.0, dim=-1)  # [T, k]
+
+        # Weighted average of k nearest neighbors
+        result = torch.zeros_like(h)
+        for i in range(actual_k):
+            result += weights[:, i:i+1] * h[topk_idx[:, i]]
+
+        matched[b] = result
+
+    return matched
+
+
 class DecoderTrainingWrapper(nn.Module):
     """Wraps Qwen3TTSTokenizerV2Decoder for efficient training.
 
-    When train_full_decoder=False: runs frozen layers under torch.no_grad() to save VRAM,
-    and only computes gradients for the unfrozen decoder blocks.
-    When train_full_decoder=True: runs the entire decoder with gradients.
+    Supports kNN self-prematching: during training, randomly replace hidden
+    frames with their nearest neighbors from the same utterance. This teaches
+    the decoder to handle frame substitution, enabling kNN-VC at inference.
     """
 
     def __init__(
@@ -485,21 +544,25 @@ class DecoderTrainingWrapper(nn.Module):
         num_frozen_decoder_modules: int,
         train_full_decoder: bool = False,
         speaker_dim: int = 256,
+        prematch_k: int = 4,
+        prematch_prob: float = 0.5,
     ):
         super().__init__()
         self.decoder = decoder
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
-        
-        hidden_dim = 1024  # actual output dim of pre_transformer
+        self.prematch_k = prematch_k
+        self.prematch_prob = prematch_prob
+
+        # Keep DisentangledProjection for backward compat (set all lambdas=0 to disable)
+        hidden_dim = 1024
         self.disentangle = DisentangledProjection(
             hidden_dim, speaker_dim=speaker_dim,
-            content_dropout=getattr(self, '_content_dropout', 0.0),
         )
         self.last_content_emb = None
-        self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
-        self.last_speaker_global = None  # [B, speaker_dim] for logging
-        self.last_original_hidden = None  # [B, T, hidden_dim] pre-disentangle
+        self.last_speaker_emb = None
+        self.last_speaker_global = None
+        self.last_original_hidden = None
 
     def forward(self, codes):
         if codes.shape[1] != self.decoder.config.num_quantizers:
@@ -509,20 +572,25 @@ class DecoderTrainingWrapper(nn.Module):
             )
 
         if self.train_full_decoder:
-            # Full decoder with gradients
             hidden = self.decoder.quantizer.decode(codes)
             hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
             hidden = self.decoder.pre_transformer(
                 inputs_embeds=hidden
             ).last_hidden_state
-            
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_contrib
-            self.last_content_emb = content_emb
-            self.last_speaker_global = speaker_global
-            self.last_original_hidden = hidden.detach()  # store for consistency loss
-            hidden = speaker_contrib + content_emb
-            
+
+            self.last_original_hidden = hidden.detach()
+
+            # kNN self-prematch during training
+            if self.training and self.prematch_prob > 0:
+                hidden = knn_self_prematch(hidden, k=self.prematch_k, prematch_prob=self.prematch_prob)
+
+            # Store dummy disentangle values for loss compat
+            self.last_content_emb = hidden
+            self.last_speaker_emb = torch.zeros_like(hidden)
+            self.last_speaker_global = torch.zeros(
+                hidden.shape[0], 256, device=hidden.device, dtype=hidden.dtype
+            )
+
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
                 for block in blocks:
@@ -531,8 +599,7 @@ class DecoderTrainingWrapper(nn.Module):
             for block in self.decoder.decoder:
                 wav = block(wav)
         else:
-            # Frozen encoder: no_grad for quantizer/pre_conv/pre_transformer
-            # (these layers are BEFORE DisentangledProjection — no gradients needed)
+            # Frozen encoder
             with torch.no_grad():
                 hidden = self.decoder.quantizer.decode(codes)
                 hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
@@ -540,18 +607,20 @@ class DecoderTrainingWrapper(nn.Module):
                     inputs_embeds=hidden
                 ).last_hidden_state
 
-            # DisentangledProjection: WITH gradients (this is what we're training)
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_contrib
-            self.last_content_emb = content_emb
-            self.last_speaker_global = speaker_global
-            self.last_original_hidden = hidden.detach()  # store for consistency loss
-            hidden = speaker_contrib + content_emb
+            self.last_original_hidden = hidden.detach()
 
-            # Frozen decoder: NO torch.no_grad() here!
-            # The frozen params have requires_grad=False so they won't update,
-            # but the computation graph flows through them so gradients reach
-            # the DisentangledProjection via the reconstruction loss.
+            # kNN self-prematch during training
+            if self.training and self.prematch_prob > 0:
+                hidden = knn_self_prematch(hidden, k=self.prematch_k, prematch_prob=self.prematch_prob)
+
+            # Store dummy disentangle values for loss compat
+            self.last_content_emb = hidden
+            self.last_speaker_emb = torch.zeros_like(hidden)
+            self.last_speaker_global = torch.zeros(
+                hidden.shape[0], 256, device=hidden.device, dtype=hidden.dtype
+            )
+
+            # Decoder (frozen blocks pass gradients through for prematch learning)
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
                 for block in blocks:
@@ -559,8 +628,6 @@ class DecoderTrainingWrapper(nn.Module):
             wav = hidden
             for block in self.decoder.decoder[: self.num_frozen]:
                 wav = block(wav)
-
-            # Trainable decoder tail: gradients enabled (last 2 blocks)
             for block in self.decoder.decoder[self.num_frozen :]:
                 wav = block(wav)
 
@@ -648,12 +715,12 @@ def create_model(args, accelerator):
         f"({trainable_decoder / total_decoder * 100:.4f}%)"
     )
 
-    # Pass content_dropout via class attribute before __init__
-    DecoderTrainingWrapper._content_dropout = getattr(args, 'content_dropout', 0.0)
     wrapper = DecoderTrainingWrapper(
         decoder, num_frozen,
         train_full_decoder=args.train_full_decoder,
         speaker_dim=args.speaker_dim,
+        prematch_k=getattr(args, 'prematch_k', 4),
+        prematch_prob=getattr(args, 'prematch_prob', 0.5),
     )
 
     # DisentangledProjection is always trainable

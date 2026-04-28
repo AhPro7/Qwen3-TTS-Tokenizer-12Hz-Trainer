@@ -8,21 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=90
+RUN_NUMBER=91
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# RESIDUAL DISENTANGLEMENT (from Run 81 debug):
+# PREMATCHED DECODER TRAINING (from kNN-VC paper, Baas et al. 2023):
 #
-# Problem: content carries everything, speaker encoder produces same
-# embedding for all speakers (cosine 0.95), voice conversion does nothing.
+# During training, randomly replace hidden frames with nearest neighbors
+# from the same utterance (self-prematching). This teaches the decoder
+# to handle frame-level substitution.
 #
-# Fix: content_proj sees (x - speaker_contrib.detach()), NOT raw x.
-# Content structurally CAN'T carry speaker info (it's subtracted + detached).
-# combined = speaker + content(x - speaker) = speaker + (x - speaker) = x
-# → perfect reconstruction regardless of speaker magnitude.
+# At inference: kNN match source frames against TARGET speaker's features.
+# The decoder handles this cleanly because it was trained on matched features.
 #
-# Speaker decoder uses Xavier init (not near-zero) → starts with meaningful
-# contribution. Diversity + norm floor prevent collapse.
+# All disentanglement losses disabled (lambda=0). No speaker/content split.
+# The kNN handles speaker transfer at inference time — no training needed.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -56,18 +55,20 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_global_rms    5.0  \
     --lambda_d_mpd         0.01 \
     --lambda_d_msd         0.1  \
-    --lambda_orth          1.0  \
+    --lambda_orth          0.0  \
     --lambda_consistency   0.0  \
-    --lambda_speaker_id    1.0  \
-    --lambda_cycle         0.5  \
+    --lambda_speaker_id    0.0  \
+    --lambda_cycle         0.0  \
     --lambda_speaker_adv   0.0  \
-    --lambda_speaker_div   1.0  \
+    --lambda_speaker_div   0.0  \
     --content_dropout      0.0  \
-    --disentangle_warmup_steps 500 \
+    --disentangle_warmup_steps 0 \
+    --prematch_prob        0.5  \
+    --prematch_k           4    \
     \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-ResidualDisentangle"
+    --wandb_run_name "Run${RUN_NUMBER}-kNN-Prematch"
