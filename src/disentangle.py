@@ -231,15 +231,39 @@ class DisentangledProjection(nn.Module):
 
         return loss
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, alpha: float = 1.0):
         """Returns (speaker_contribution, content_emb, speaker_global).
 
-        speaker_contribution: [B, T, hidden_dim]  (broadcast from global)
-        content_emb:          [B, T, hidden_dim]  (per-frame, bottlenecked)
-        speaker_global:       [B, speaker_dim]    (for logging / swap)
+        Args:
+            x: [B, T, hidden_dim] — pre_transformer output.
+            alpha: Bottleneck blend factor (0.0 = identity, 1.0 = full bottleneck).
+                   Ramps from 0→1 over training to avoid distribution shift
+                   that kills frozen decoder blocks.
+
+        Returns:
+            speaker_contribution: [B, T, hidden_dim]  (broadcast from global)
+            content_emb:          [B, T, hidden_dim]  (alpha-blended)
+            speaker_global:       [B, speaker_dim]    (for logging / swap)
+
+        Also stores self.last_content_bottleneck for GRL/VC losses
+        (always the PURE bottleneck output, regardless of alpha).
         """
         x = self._match_dtype(x)
         speaker_global = self.encode_speaker(x)                       # [B, speaker_dim]
         speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])  # [B, T, H]
-        content_emb = self.encode_content(x)                          # [B, T, H]
+
+        # Pure bottleneck path (for GRL and VC — always full bottleneck)
+        content_bottleneck = self.encode_content(x)                   # [B, T, H]
+        self.last_content_bottleneck = content_bottleneck
+
+        # Alpha-blended content for reconstruction:
+        #   alpha=0 → pure identity x (like Run 81, perfect reconstruction)
+        #   alpha=1 → full bottleneck (maximum disentanglement)
+        if alpha >= 1.0:
+            content_emb = content_bottleneck
+        elif alpha <= 0.0:
+            content_emb = x
+        else:
+            content_emb = (1.0 - alpha) * x + alpha * content_bottleneck
+
         return speaker_contribution, content_emb, speaker_global

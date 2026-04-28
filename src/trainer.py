@@ -479,6 +479,17 @@ def parse_args():
             "learn reasonable reconstruction before the discriminator can collapse it."
         ),
     )
+    parser.add_argument(
+        "--bottleneck_ramp_steps",
+        type=int,
+        default=5000,
+        help=(
+            "Steps over which the content bottleneck alpha ramps from 0 to 1. "
+            "At alpha=0, content=identity (perfect reconstruction, like Run 81). "
+            "At alpha=1, content=full bottleneck (maximum disentanglement). "
+            "Prevents distribution shift that kills frozen decoder blocks."
+        ),
+    )
 
     parser.add_argument(
         "--disentangle_warmup_steps",
@@ -559,7 +570,8 @@ class DecoderTrainingWrapper(nn.Module):
                 inputs_embeds=hidden
             ).last_hidden_state
             
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
+            alpha = getattr(self, 'current_alpha', 1.0)
+            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden, alpha=alpha)
             self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
             self.last_speaker_global = speaker_global
@@ -584,7 +596,8 @@ class DecoderTrainingWrapper(nn.Module):
                 ).last_hidden_state
 
             # DisentangledProjection: WITH gradients (this is what we're training)
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
+            alpha = getattr(self, 'current_alpha', 1.0)
+            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden, alpha=alpha)
             self.last_speaker_emb = speaker_contrib
             self.last_content_emb = content_emb
             self.last_speaker_global = speaker_global
@@ -1364,6 +1377,13 @@ def main():
             target_audio = batch["audio"].to(accelerator.device)
             audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
+            # Compute bottleneck alpha ramp (0 = identity, 1 = full bottleneck)
+            if args.bottleneck_ramp_steps > 0:
+                bottleneck_alpha = min(1.0, global_step / args.bottleneck_ramp_steps)
+            else:
+                bottleneck_alpha = 1.0
+            accelerator.unwrap_model(model).current_alpha = bottleneck_alpha
+
             # Generator forward
             pred_48k = model(audio_codes)
 
@@ -1523,6 +1543,8 @@ def main():
                 content_emb = unwrapped_model.last_content_emb
                 speaker_global = unwrapped_model.last_speaker_global
                 original_hidden = unwrapped_model.last_original_hidden
+                # Pure bottleneck output for GRL/VC (NOT alpha-blended)
+                content_bottleneck = unwrapped_model.disentangle.last_content_bottleneck
 
                 # Linear warmup ramp for disentanglement losses.
                 # Prevents GAN collapse by letting the model stabilize with
@@ -1562,16 +1584,15 @@ def main():
                     loss_speaker_id = content_emb.new_zeros(())
 
                 # In-batch speaker swap cycle consistency:
-                # Swap speakers within the batch, re-extract, ensure match.
-                # Trains the model to handle voice conversion during training.
+                # Uses PURE bottleneck content (tests actual VC path).
                 if args.lambda_cycle > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
                     B = speaker_global.shape[0]
                     perm = torch.randperm(B, device=speaker_global.device)
                     swapped_speaker = speaker_global[perm]
                     swapped_contrib = unwrapped_model.disentangle.decode_speaker(
-                        swapped_speaker, content_emb.shape[1]
+                        swapped_speaker, content_bottleneck.shape[1]
                     )
-                    swapped_combined = swapped_contrib + content_emb.detach()
+                    swapped_combined = swapped_contrib + content_bottleneck.detach()
                     re_swapped = unwrapped_model.disentangle.encode_speaker(
                         swapped_combined
                     )
@@ -1582,22 +1603,17 @@ def main():
                     loss_cycle = content_emb.new_zeros(())
 
                 # Speaker adversarial loss on content (GRL):
-                # Forces content_emb to NOT encode speaker identity.
-                # The gradient reversal layer inverts gradients so the content
-                # encoder is trained to make speaker classification impossible.
+                # Operates on PURE bottleneck output (not alpha-blended)
+                # so gradient always flows through the content encoder.
                 if args.lambda_speaker_adv > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
                     loss_speaker_adv = unwrapped_model.disentangle.speaker_adversarial_loss(
-                        content_emb, grl_lambda=dis_ramp
+                        content_bottleneck, grl_lambda=dis_ramp
                     )
                 else:
                     loss_speaker_adv = content_emb.new_zeros(())
 
                 # VC mel verification loss:
-                # Decodes swapped-speaker hidden through the full decoder,
-                # then compares time-averaged mel spectra with the target
-                # speaker's audio. This is the "cloning discriminator" —
-                # it verifies speaker transfer at the waveform level.
-                # Only computed every vc_mel_every steps to save VRAM.
+                # Uses PURE bottleneck content + swapped speaker → decode → compare mel.
                 compute_vc_mel = (
                     args.lambda_vc_mel > 0
                     and pred.shape[0] >= 2
@@ -1605,15 +1621,15 @@ def main():
                     and global_step % args.vc_mel_every == 0
                 )
                 if compute_vc_mel:
-                    # Reuse the swap permutation from cycle loss (or create one)
+                    # Reuse swap perm from cycle loss or create one
                     if args.lambda_cycle <= 0 or pred.shape[0] < 2:
                         B = speaker_global.shape[0]
                         perm = torch.randperm(B, device=speaker_global.device)
                         swapped_speaker = speaker_global[perm]
                         swapped_contrib = unwrapped_model.disentangle.decode_speaker(
-                            swapped_speaker, content_emb.shape[1]
+                            swapped_speaker, content_bottleneck.shape[1]
                         )
-                        swapped_combined = swapped_contrib + content_emb.detach()
+                        swapped_combined = swapped_contrib + content_bottleneck.detach()
 
                     # Decode swapped hidden → waveform (gradients flow to disentangle)
                     vc_wav = unwrapped_model.decode_hidden(swapped_combined)
@@ -1743,6 +1759,7 @@ def main():
                         "g/loss_speaker_adv": loss_speaker_adv.item(),
                         "g/loss_vc_mel": loss_vc_mel.item(),
                         "g/dis_ramp": dis_ramp,
+                        "g/bottleneck_alpha": bottleneck_alpha,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,

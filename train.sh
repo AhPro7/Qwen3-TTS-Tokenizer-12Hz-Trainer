@@ -8,23 +8,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=86
+RUN_NUMBER=87
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Run 84 mel stuck at 7-8 despite 2000 steps of reconstruction-only training.
+# Runs 82-86 all failed because the content bottleneck (random init) produces
+# a different distribution than what the frozen decoder expects → mel=7-8.
 #
-# ROOT CAUSE: When resuming from Run 81 with strict=False, the old
-# speaker_decoder weights (near-zero, because Run 81 never needed the speaker
-# path) were loaded and overwrote the fresh Xavier init. This killed the
-# speaker path — it couldn't contribute to reconstruction, so the content
-# bottleneck (256-dim) had to carry EVERYTHING alone. Not enough capacity.
+# ROOT CAUSE: The frozen Qwen decoder blocks expect input ≈ pre_transformer
+# output. ANY randomly-initialized transform destroys this distribution.
 #
-# Fixes:
-#   --no_resume_disentangle: fresh DisentangledProjection with non-zero
-#     speaker_decoder (Xavier gain=0.5). Both paths contribute from step 0.
-#   --content_bottleneck_dim 512: wider bottleneck (50% retention).
-#     256-dim was too tight — mel plateaued at ~7.
-#   --gan_start_step 3000: longer reconstruction pre-training.
+# Fix: ALPHA-BLENDED SOFT BOTTLENECK
+#   content = (1-alpha)*x + alpha*bottleneck(x)
+#   alpha=0 at step 0 → content=x (identity, PERFECT reconstruction)
+#   alpha ramps to 1.0 over 5000 steps → gradual transition
+#
+# GRL + VC mel operate on PURE bottleneck output (full gradient always).
+# Reconstruction uses alpha-blended content (never drops quality suddenly).
+# GAN stays on from step 0 — no collapse because reconstruction is good!
+#
+# Resume from Run 81 WITH disentangle (speaker encoder is useful).
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -35,7 +37,6 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --resume_from  "${OUTPUT_DIR}/run81/checkpoint-step-1000" \
     --no_resume_optimizer \
     --no_resume_discriminator \
-    --no_resume_disentangle \
     \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -56,7 +57,6 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --save_every 500 \
     --eval_every 100 \
     --log_every 5 \
-    --gan_start_step 3000 \
     \
     --lambda_adv           0.3  \
     --lambda_fm            3.0  \
@@ -71,14 +71,15 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_speaker_adv   0.5  \
     --lambda_vc_mel        1.0  \
     --vc_mel_every         5    \
-    --disentangle_warmup_steps 1500 \
+    --disentangle_warmup_steps 1000 \
+    --bottleneck_ramp_steps    5000 \
     \
-    --content_bottleneck_dim 512 \
+    --content_bottleneck_dim 256 \
     \
     --spike_skip_threshold 3.0 \
     --spike_ema_decay      0.99 \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-FreshDisentangle-BN512"
+    --wandb_run_name "Run${RUN_NUMBER}-AlphaBlend-BN256"
 
