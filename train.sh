@@ -60,4 +60,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-GradFlowFix"
+    --wandb_run_name "Run${RUN_NUMBER}-GradFlowFix-again"
