@@ -208,7 +208,7 @@ class DisentangledProjection(nn.Module):
 
         # Contrastive: each sample is its own class
         # similarity matrix [B, B], labels = [0, 1, ..., B-1]
-        temp = self.log_temp.exp().clamp(min=0.01, max=100.0)
+        temp = self.speaker_adversarial.log_temp.exp().clamp(min=0.01, max=100.0)
         speaker_repr = nn.functional.normalize(speaker_repr, dim=-1)
         sim_matrix = torch.mm(speaker_repr, speaker_repr.t()) * temp
         labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
