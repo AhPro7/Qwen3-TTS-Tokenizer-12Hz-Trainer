@@ -8,35 +8,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=87
+RUN_NUMBER=88
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# Runs 82-86 all failed because the content bottleneck (random init) produces
-# a different distribution than what the frozen decoder expects → mel=7-8.
+# Fresh start from scratch (no checkpoint resume).
 #
-# ROOT CAUSE: The frozen Qwen decoder blocks expect input ≈ pre_transformer
-# output. ANY randomly-initialized transform destroys this distribution.
-#
-# Fix: ALPHA-BLENDED SOFT BOTTLENECK
+# Alpha-blended soft bottleneck:
 #   content = (1-alpha)*x + alpha*bottleneck(x)
-#   alpha=0 at step 0 → content=x (identity, PERFECT reconstruction)
-#   alpha ramps to 1.0 over 5000 steps → gradual transition
+#   alpha=0 at step 0 → content=x (identity, perfect reconstruction)
+#   alpha ramps to 1.0 over 5000 steps → gradual disentanglement
 #
 # GRL + VC mel operate on PURE bottleneck output (full gradient always).
-# Reconstruction uses alpha-blended content (never drops quality suddenly).
-# GAN stays on from step 0 — no collapse because reconstruction is good!
-#
-# Resume from Run 81 WITH disentangle (speaker encoder is useful).
+# Reconstruction uses alpha-blended content (smooth transition).
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
-    \
-    --resume_from  "${OUTPUT_DIR}/run81/checkpoint-step-1000" \
-    --no_resume_optimizer \
-    --no_resume_discriminator \
     \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -81,5 +70,5 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-AlphaBlend-BN256"
+    --wandb_run_name "Run${RUN_NUMBER}-Fresh-AlphaBlend"
 
