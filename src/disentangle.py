@@ -11,6 +11,11 @@ Architecture (AutoVC-inspired bottleneck):
                 → 2-layer decoder → broadcast to all frames.
   Content path: per-frame 2-layer MLP (keeps temporal detail).
 
+Disentanglement mechanisms (added on top of Run 81):
+  1. GRL (Gradient Reversal Layer): trains content to NOT encode speaker.
+  2. Speaker contrastive loss: pushes in-batch speaker embeddings apart.
+  3. Content feature dropout: forces decoder to rely on speaker path.
+
 The temporal pooling in the speaker path makes it structurally impossible
 to encode per-frame content, forcing the content path to carry that
 information instead.
@@ -18,6 +23,51 @@ information instead.
 
 import torch
 import torch.nn as nn
+from torch.autograd import Function
+
+
+# ── Gradient Reversal Layer ──────────────────────────────────────────────────
+class _GradientReversal(Function):
+    """Reverses gradients during backward pass (for adversarial training)."""
+
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambda_ * grad_output, None
+
+
+def gradient_reversal(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
+    """Apply gradient reversal: forward = identity, backward = -lambda * grad."""
+    return _GradientReversal.apply(x, lambda_)
+
+
+# ── Speaker Adversarial Head ─────────────────────────────────────────────────
+class SpeakerAdversarialHead(nn.Module):
+    """Classifies speaker from content embeddings (via GRL).
+
+    During forward: tries to predict which batch sample a content frame
+    came from. The GRL reverses gradients so the content encoder learns
+    to make this IMPOSSIBLE → content becomes speaker-free.
+    """
+
+    def __init__(self, hidden_dim: int = 1024, proj_dim: int = 256):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, proj_dim),
+            nn.ReLU(),
+            nn.Linear(proj_dim, proj_dim),
+        )
+        # Temperature for contrastive similarity
+        self.log_temp = nn.Parameter(torch.tensor(2.0).log())
+
+    def forward(self, content_emb: torch.Tensor) -> torch.Tensor:
+        """content_emb: [B, T, H] → speaker_repr: [B, proj_dim]"""
+        # Time-average → global content representation
+        return self.classifier(content_emb.mean(dim=1))
 
 
 class DisentangledProjection(nn.Module):
@@ -26,12 +76,21 @@ class DisentangledProjection(nn.Module):
     Args:
         hidden_dim: Transformer hidden dimension (default: 1024).
         speaker_dim: Speaker bottleneck dimension (default: 256).
+        content_dropout: Dropout rate for content features during training.
+            Forces the decoder to rely on the speaker path for stable
+            features (speaker identity). Set to 0.0 to disable.
     """
 
-    def __init__(self, hidden_dim: int = 1024, speaker_dim: int = 256):
+    def __init__(
+        self,
+        hidden_dim: int = 1024,
+        speaker_dim: int = 256,
+        content_dropout: float = 0.0,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.speaker_dim = speaker_dim
+        self.content_dropout = content_dropout
 
         # Speaker branch: encode → pool → decode
         self.speaker_encoder = nn.Sequential(
@@ -55,6 +114,12 @@ class DisentangledProjection(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # Content dropout (applied during training only)
+        self.content_drop = nn.Dropout(p=content_dropout) if content_dropout > 0 else None
+
+        # Speaker adversarial head (GRL)
+        self.speaker_adversarial = SpeakerAdversarialHead(hidden_dim, speaker_dim)
 
         self._warm_start_init()
 
@@ -116,6 +181,71 @@ class DisentangledProjection(nn.Module):
         """x: [B, T, hidden_dim] → content_emb: [B, T, hidden_dim]"""
         return self.content_proj(self._match_dtype(x))
 
+    def speaker_adversarial_loss(
+        self, content_emb: torch.Tensor, grl_lambda: float = 1.0
+    ) -> torch.Tensor:
+        """Contrastive speaker classification on GRL-reversed content.
+
+        If the adversarial head CAN classify speakers from content, it means
+        content still carries speaker info. The GRL reverses the gradient so
+        the content encoder learns to strip speaker identity.
+
+        Args:
+            content_emb: [B, T, hidden_dim] — content embeddings.
+            grl_lambda: GRL strength (ramp from 0→1 during warmup).
+
+        Returns:
+            Scalar loss (cross-entropy). Higher = more speaker leakage.
+        """
+        content_emb = self._match_dtype(content_emb)
+
+        # Reverse gradients through GRL → content encoder learns to
+        # make speaker classification impossible
+        content_reversed = gradient_reversal(content_emb, grl_lambda)
+
+        # Project to speaker space
+        speaker_repr = self.speaker_adversarial(content_reversed)  # [B, proj_dim]
+
+        # Contrastive: each sample is its own class
+        # similarity matrix [B, B], labels = [0, 1, ..., B-1]
+        temp = self.log_temp.exp().clamp(min=0.01, max=100.0)
+        speaker_repr = nn.functional.normalize(speaker_repr, dim=-1)
+        sim_matrix = torch.mm(speaker_repr, speaker_repr.t()) * temp
+        labels = torch.arange(sim_matrix.size(0), device=sim_matrix.device)
+
+        loss = nn.functional.cross_entropy(sim_matrix, labels)
+
+        return loss
+
+    def speaker_diversity_loss(
+        self, speaker_globals: torch.Tensor
+    ) -> torch.Tensor:
+        """Push in-batch speaker embeddings apart (contrastive).
+
+        The speaker encoder currently maps all speakers to cosine~0.95.
+        This loss penalizes high pairwise similarity, forcing the encoder
+        to produce DISTINCT embeddings for different speakers.
+
+        Args:
+            speaker_globals: [B, speaker_dim] — speaker embeddings from batch.
+
+        Returns:
+            Scalar loss. Higher = embeddings too similar.
+        """
+        speaker_globals = self._match_dtype(speaker_globals)
+        normed = nn.functional.normalize(speaker_globals, dim=-1)
+        sim = torch.mm(normed, normed.t())  # [B, B]
+
+        # Exclude diagonal (self-similarity = 1.0 by definition)
+        B = sim.size(0)
+        mask = ~torch.eye(B, dtype=torch.bool, device=sim.device)
+
+        # Penalize high off-diagonal similarity
+        # Mean of squared off-diagonal similarities
+        loss = (sim[mask] ** 2).mean()
+
+        return loss
+
     def forward(self, x: torch.Tensor):
         """Returns (speaker_contribution, content_emb, speaker_global).
 
@@ -127,4 +257,11 @@ class DisentangledProjection(nn.Module):
         speaker_global = self.encode_speaker(x)                       # [B, speaker_dim]
         speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])  # [B, T, H]
         content_emb = self.encode_content(x)                          # [B, T, H]
+
+        # Content feature dropout (training only):
+        # Forces the decoder to rely on the speaker path for stable features.
+        # At inference (eval mode), dropout is disabled automatically.
+        if self.content_drop is not None:
+            content_emb = self.content_drop(content_emb)
+
         return speaker_contribution, content_emb, speaker_global

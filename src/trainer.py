@@ -332,6 +332,33 @@ def parse_args():
             "Trains the model to handle voice conversion during training. 0 disables."
         ),
     )
+    parser.add_argument(
+        "--lambda_speaker_adv",
+        type=float,
+        default=0.5,
+        help=(
+            "GRL adversarial loss weight. Strips speaker info from content "
+            "via gradient reversal. Forces decoder to rely on speaker path. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_speaker_div",
+        type=float,
+        default=1.0,
+        help=(
+            "Speaker diversity loss weight. Pushes in-batch speaker embeddings apart "
+            "(contrastive). Fixes the speaker_global A≈B problem (cosine 0.95). 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--content_dropout",
+        type=float,
+        default=0.1,
+        help=(
+            "Content feature dropout rate during training. Forces decoder to rely on "
+            "speaker path for stable features. 0 disables."
+        ),
+    )
 
     # Architecture
     parser.add_argument(
@@ -465,7 +492,10 @@ class DecoderTrainingWrapper(nn.Module):
         self.train_full_decoder = train_full_decoder
         
         hidden_dim = 1024  # actual output dim of pre_transformer
-        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=speaker_dim)
+        self.disentangle = DisentangledProjection(
+            hidden_dim, speaker_dim=speaker_dim,
+            content_dropout=getattr(self, '_content_dropout', 0.0),
+        )
         self.last_content_emb = None
         self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
         self.last_speaker_global = None  # [B, speaker_dim] for logging
@@ -618,6 +648,8 @@ def create_model(args, accelerator):
         f"({trainable_decoder / total_decoder * 100:.4f}%)"
     )
 
+    # Pass content_dropout via class attribute before __init__
+    DecoderTrainingWrapper._content_dropout = getattr(args, 'content_dropout', 0.0)
     wrapper = DecoderTrainingWrapper(
         decoder, num_frozen,
         train_full_decoder=args.train_full_decoder,
@@ -1458,6 +1490,26 @@ def main():
                 else:
                     loss_cycle = content_emb.new_zeros(())
 
+                # GRL adversarial: strip speaker info from content.
+                # The gradient reversal layer ensures the content encoder
+                # learns to make speaker classification IMPOSSIBLE.
+                if args.lambda_speaker_adv > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
+                    loss_speaker_adv = unwrapped_model.disentangle.speaker_adversarial_loss(
+                        content_emb, grl_lambda=dis_ramp
+                    )
+                else:
+                    loss_speaker_adv = content_emb.new_zeros(())
+
+                # Speaker diversity: push in-batch speaker embeddings apart.
+                # Fixes the core problem: speaker encoder maps all speakers
+                # to cosine~0.95. This forces distinct embeddings.
+                if args.lambda_speaker_div > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
+                    loss_speaker_div = unwrapped_model.disentangle.speaker_diversity_loss(
+                        speaker_global
+                    )
+                else:
+                    loss_speaker_div = content_emb.new_zeros(())
+
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
@@ -1467,6 +1519,8 @@ def main():
                     + args.lambda_consistency * loss_consistency
                     + dis_ramp * args.lambda_speaker_id * loss_speaker_id
                     + dis_ramp * args.lambda_cycle * loss_cycle
+                    + dis_ramp * args.lambda_speaker_adv * loss_speaker_adv
+                    + dis_ramp * args.lambda_speaker_div * loss_speaker_div
                 )
 
                 # =====================
@@ -1556,6 +1610,8 @@ def main():
                         "g/loss_consistency": loss_consistency.item(),
                         "g/loss_speaker_id": loss_speaker_id.item(),
                         "g/loss_cycle": loss_cycle.item(),
+                        "g/loss_speaker_adv": loss_speaker_adv.item(),
+                        "g/loss_speaker_div": loss_speaker_div.item(),
                         "g/dis_ramp": dis_ramp,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],

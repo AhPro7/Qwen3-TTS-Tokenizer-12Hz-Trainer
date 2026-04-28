@@ -8,14 +8,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=81
+RUN_NUMBER=89
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# RESTORED to Run 81 baseline (the last working config).
+# Run 81 debug revealed the ROOT CAUSE of voice conversion failure:
+#   1. Speaker encoder maps all speakers to cosine~0.95 (can't distinguish!)
+#   2. Content carries everything (zero-speaker test sounds identical)
+#   3. Speaker path IS active (norm 1.4) but not speaker-specific
 #
-# Identity-init content path, near-zero speaker path.
-# Great reconstruction (mel=2.3 after 1K steps).
-# Disentanglement via ortho + speaker_id + cycle losses.
+# 3 targeted fixes (no bottleneck, no alpha blending):
+#   --lambda_speaker_adv 0.5  → GRL strips speaker info from content
+#   --lambda_speaker_div 1.0  → Contrastive pushes speaker embeddings apart
+#   --content_dropout    0.1  → Forces decoder to rely on speaker path
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -53,6 +57,9 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    1.0  \
     --lambda_cycle         0.5  \
+    --lambda_speaker_adv   0.5  \
+    --lambda_speaker_div   1.0  \
+    --content_dropout      0.1  \
     --disentangle_warmup_steps 500 \
     \
     --spike_skip_threshold 3.0 \
@@ -60,4 +67,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-GradFlowFix-again"
+    --wandb_run_name "Run${RUN_NUMBER}-GRL-Diversity-Dropout"
