@@ -115,7 +115,7 @@ def setup_model(checkpoint_path, device, dtype=torch.bfloat16):
     return tokenizer, decoder, dis, output_sr
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_to_hidden(tokenizer, decoder, audio, device, dtype):
     """audio (numpy) → hidden [1, T, 1024]"""
     encoded = tokenizer.encode(audios=[audio], sr=TOKENIZER_SR)
@@ -127,7 +127,7 @@ def encode_to_hidden(tokenizer, decoder, audio, device, dtype):
     return hidden
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def decode_hidden(decoder, hidden):
     """hidden [1, T, 1024] → waveform numpy"""
     x = hidden.permute(0, 2, 1)
@@ -191,8 +191,9 @@ def main():
     print("Disentangling...")
     print("=" * 70)
     
-    speaker_contrib_a, content_a, speaker_global_a = dis(hidden_a)
-    speaker_contrib_b, content_b, speaker_global_b = dis(hidden_b)
+    with torch.no_grad():
+        speaker_contrib_a, content_a, speaker_global_a = dis(hidden_a)
+        speaker_contrib_b, content_b, speaker_global_b = dis(hidden_b)
     
     # ── Analysis 1: Norms ───────────────────────────────────────────────────
     print("\n── Contribution Norms (per-frame average) ──")
