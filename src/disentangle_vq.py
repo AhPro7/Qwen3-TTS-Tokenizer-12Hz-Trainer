@@ -61,7 +61,7 @@ class VectorQuantize(nn.Module):
         if self.training:
             one_hot = F.one_hot(indices, self.codebook_size).float()
             cluster_size = one_hot.sum(0)
-            embed_sum = one_hot.t() @ x_flat
+            embed_sum = (one_hot.t() @ x_flat).float()
 
             # Do EMA in float32 to avoid bf16 lerp_ mismatch
             ema_cs = self.ema_cluster_size.float()
