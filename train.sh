@@ -11,25 +11,20 @@ OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
 RUN_NUMBER=95
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# EXPERIMENT 95: SINGLE CODEBOOK VQ
+# EXPERIMENT 95 (v2 — FIXED): SINGLE CODEBOOK VQ
 #
-# Merge 16 RVQ codebooks into ONE large codebook (16384 codes).
-# Produces ONE discrete token per frame at 12.5 Hz.
-# Pure reconstruction — no speaker disentanglement.
+# Follows the PROVEN pattern from Exp 81's content VQ:
+#   1. Near-identity pre-projection (1024 → 1024) — NOT 256-dim!
+#   2. VQ in same 1024-dim — codebook inits from meaningful hidden states
+#   3. Single alpha blend (NO double-alpha that killed v1)
+#   4. Direct VQ output to decoder (NO near-zero post_vq)
 #
-# Architecture:
-#   frozen encoder → hidden [B, T, 1024]
-#     → LayerNorm + MLP(1024 → 256)  [pre_vq_proj]
-#     → VQ(dim=256, size=16384)      [single codebook]
-#     → MLP(256 → 1024) + LayerNorm  [post_vq_proj]
-#     → upsample + decoder blocks → waveform
+# Fixes from failed v1:
+#   - v1 bug: double alpha (α²) → VQ got no gradients → codebook collapsed
+#   - v1 bug: near-zero post_vq init → decoder got zeros → empty audio
+#   - v1 bug: 256-dim projection → random init destroyed hidden structure
 #
-# VQ alpha ramps 0→1 over 1000 steps (warm start: continuous first, then VQ).
-# Entropy regularization prevents codebook collapse.
-# Dead code reset reinitializes unused codes from batch data.
-#
-# Bitrate: log2(16384) * 12.5 = 175 bits/sec
-# (vs. 16 * 10 * 12.5 = 2000 bits/sec for 16-codebook RVQ)
+# 8192 codes × 1024-dim, same architecture as exp 81 content path.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -38,7 +33,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     \
     --single_codebook \
-    --codebook_size 16384 \
+    --codebook_size 8192 \
     --vq_dim 256 \
     --entropy_weight 0.1 \
     \
@@ -47,13 +42,13 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
     \
-    --lr_g 2e-4 \
+    --lr_g 1e-4 \
     --lr_d 2e-4 \
     --beta1_g 0.8 \
     --beta2_g 0.99 \
     --beta1_d 0.8 \
     --beta2_d 0.99 \
-    --warmup_steps 500 \
+    --warmup_steps 300 \
     --weight_decay 0.01 \
     --max_grad_norm 1.0 \
     \
@@ -76,7 +71,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_speaker_adv   0.0  \
     --lambda_speaker_div   0.0  \
     --content_dropout      0.0  \
-    --disentangle_warmup_steps 1000 \
+    --disentangle_warmup_steps 500 \
     --prematch_prob        0.0  \
     --prematch_k           4    \
     \
@@ -85,4 +80,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-SingleCodebook-16384"
+    --wandb_run_name "Run${RUN_NUMBER}-SingleCodebook-8192-FIXED"

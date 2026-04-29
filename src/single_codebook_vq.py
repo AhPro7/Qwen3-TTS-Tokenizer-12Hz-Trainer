@@ -4,24 +4,21 @@ SingleCodebookVQ: Merge 16 RVQ codebooks into ONE discrete token per frame.
 
 Experiment 95: Pure reconstruction — no speaker disentanglement.
 
-Architecture:
+Architecture (follows the PROVEN pattern from Exp 81's content VQ):
   hidden [B, T, 1024]  (from frozen pre_transformer)
-    → LayerNorm + MLP(1024 → vq_dim)         [pre_vq_proj]
-    → VectorQuantize(vq_dim, codebook_size)   [single large codebook]
-    → MLP(vq_dim → 1024) + LayerNorm         [post_vq_proj]
-    → quantized [B, T, 1024]                 [decoder input]
+    → pre_vq_proj (near-identity MLP, 1024 → 1024)
+    → VectorQuantize(1024-dim, 8192 codes)
+    → quantized [B, T, 1024]  (directly to decoder, NO post-projection!)
 
-Key design choices:
-  - Project to lower dim (256) for VQ: avoids curse of dimensionality.
-  - Large codebook (16384): compensates for losing 16 codebooks.
-  - EMA codebook updates + dead code reset: prevents codebook collapse.
-  - Entropy regularization: maximizes codebook utilization.
-  - Alpha warmup: smooth transition from continuous → quantized.
-  - Residual warmup: output = hidden + α*(VQ_output - hidden)
-    so at α=0 the decoder sees the original hidden (perfect recon).
+Key differences from the broken v1:
+  1. SAME dimension as hidden (1024) — no information-destroying projection
+  2. Near-identity init for pre_vq — decoder sees good input from step 0
+  3. SINGLE alpha blend — no double-alpha that zeroed out gradients
+  4. NO post_vq projection — VQ output goes directly to decoder
+  5. Proven VQ class from exp 81 with EMA + data init
 
 Token rate: 12.5 Hz (one token per frame).
-Bitrate: log2(16384) * 12.5 = 175 bits/sec (vs. 16*10*12.5 = 2000 for RVQ-16).
+Bitrate: log2(8192) * 12.5 = 162.5 bits/sec (vs. 2000 for RVQ-16).
 """
 
 import torch
@@ -30,7 +27,11 @@ import torch.nn.functional as F
 
 
 class VectorQuantizeEnhanced(nn.Module):
-    """Enhanced VQ with EMA, dead code reset, and usage tracking."""
+    """VQ with EMA codebook updates, dead code reset, and usage tracking.
+
+    Based on the proven VectorQuantize from disentangle_vq.py (exp 81),
+    enhanced with dead code reset and usage metrics.
+    """
 
     def __init__(self, dim, codebook_size, decay=0.99, eps=1e-5,
                  threshold_dead_frames=2):
@@ -51,12 +52,12 @@ class VectorQuantizeEnhanced(nn.Module):
                              self.embedding.weight.data.clone())
         self.register_buffer("initted", torch.tensor(False))
 
-        # Track frames since each code was last used (for dead code reset)
+        # Dead code tracking
         self.register_buffer("frames_since_used",
                              torch.zeros(codebook_size, dtype=torch.long))
 
     def _init_from_data(self, x_flat):
-        """Initialize codebook from first batch (k-means++ style)."""
+        """Initialize codebook from first batch of data (k-means++ style)."""
         if self.initted.item():
             return
         n = min(x_flat.shape[0], self.codebook_size)
@@ -68,23 +69,27 @@ class VectorQuantizeEnhanced(nn.Module):
         self.initted.fill_(True)
 
     def _reset_dead_codes(self, x_flat):
-        """Reset codes that haven't been used for threshold_dead_frames steps."""
+        """Reset codes unused for threshold_dead_frames steps."""
         dead_mask = self.frames_since_used >= self.threshold_dead_frames
         num_dead = dead_mask.sum().item()
         if num_dead == 0:
             return 0
 
-        # Pick random vectors from the current batch to replace dead codes
         n_replace = min(num_dead, x_flat.shape[0])
         if n_replace == 0:
             return 0
 
+        # Replace dead codes with random batch vectors + small noise
         replace_indices = torch.randperm(
             x_flat.shape[0], device=x_flat.device
         )[:n_replace]
         dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_replace]
 
         replacement = x_flat[replace_indices].detach()
+        # Add small noise to avoid exact duplicates
+        noise = torch.randn_like(replacement) * 0.01
+        replacement = replacement + noise
+
         self.embedding.weight.data[dead_indices] = replacement.to(
             self.embedding.weight.dtype
         )
@@ -105,14 +110,8 @@ class VectorQuantizeEnhanced(nn.Module):
         if self.training:
             self._init_from_data(x_flat)
 
-        # L2 normalized distances for stability
-        # dist(a,b) = ||a||^2 + ||b||^2 - 2*a·b
-        cb = self.embedding.weight.float()
-        dist = (
-            x_flat.pow(2).sum(1, keepdim=True)
-            + cb.pow(2).sum(1, keepdim=True).t()
-            - 2 * x_flat @ cb.t()
-        )
+        # Distances (always in float32 for numerical stability)
+        dist = torch.cdist(x_flat, self.embedding.weight.float())
         indices = dist.argmin(dim=-1)
         quantized = self.embedding(indices).to(x.dtype)
 
@@ -121,7 +120,6 @@ class VectorQuantizeEnhanced(nn.Module):
             unique_codes = indices.unique().numel()
             usage_frac = unique_codes / self.codebook_size
 
-            # Perplexity: exp(entropy) of the assignment distribution
             one_hot_counts = F.one_hot(
                 indices, self.codebook_size
             ).float().sum(0)
@@ -129,7 +127,7 @@ class VectorQuantizeEnhanced(nn.Module):
             entropy = -(probs * torch.log(probs + 1e-10)).sum()
             perplexity = torch.exp(entropy)
 
-        # EMA codebook update
+        # EMA codebook update (all in float32, then cast back)
         if self.training:
             one_hot = F.one_hot(indices, self.codebook_size).float()
             cluster_size = one_hot.sum(0)
@@ -151,13 +149,11 @@ class VectorQuantizeEnhanced(nn.Module):
                 new_weights.to(self.embedding.weight.dtype)
             )
 
-            # Update dead code tracking
+            # Dead code tracking + reset
             used_mask = cluster_size > 0
             self.frames_since_used[used_mask] = 0
             self.frames_since_used[~used_mask] += 1
-
-            # Reset dead codes periodically
-            num_reset = self._reset_dead_codes(x_flat)
+            self._reset_dead_codes(x_flat)
 
         # Losses
         commitment_loss = F.mse_loss(x_flat, quantized.detach().float())
@@ -189,73 +185,67 @@ class VectorQuantizeEnhanced(nn.Module):
 
 
 class SingleCodebookVQ(nn.Module):
-    """Single codebook VQ — Experiment 95.
+    """Single codebook VQ — Experiment 95 (fixed).
 
-    Merges all 16 RVQ codebooks into ONE token per frame.
-    Pure reconstruction, no speaker disentanglement.
+    Follows the EXACT proven pattern from Exp 81's content VQ:
+      1. Near-identity pre-projection (1024 → 1024)
+      2. VQ in the SAME dimension (1024-dim, NO dimension reduction)
+      3. Single alpha blend (NO double alpha)
+      4. VQ output goes DIRECTLY to decoder (NO post-projection)
+
+    This is essentially exp 81's content path with a larger codebook
+    and no speaker path.
 
     Args:
         hidden_dim: Input dimension from pre_transformer (1024 for Qwen).
-        vq_dim: Quantization space dimension (default 256).
-        codebook_size: Number of codes (default 16384).
+        codebook_size: Number of codes (default 8192).
         decay: EMA decay for codebook updates.
-        commitment_weight: Weight for commitment loss component.
-        entropy_weight: Weight for entropy regularization (codebook usage).
     """
 
     def __init__(
         self,
         hidden_dim=1024,
-        vq_dim=256,
-        codebook_size=16384,
+        vq_dim=256,      # IGNORED — kept for CLI compat, always uses hidden_dim
+        codebook_size=8192,
         decay=0.99,
-        commitment_weight=1.0,
-        entropy_weight=0.1,
+        commitment_weight=1.0,  # kept for compat
+        entropy_weight=0.1,     # kept for compat
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.vq_dim = vq_dim
         self.codebook_size = codebook_size
-        self.commitment_weight = commitment_weight
-        self.entropy_weight = entropy_weight
 
-        # Pre-VQ: project 1024 → vq_dim
+        # Pre-VQ: near-identity projection in SAME dimension (1024 → 1024)
+        # Exactly like exp 81's content_proj
         self.pre_vq = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, vq_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # VQ layer
+        # VQ in full 1024-dim — NO dimension reduction!
         self.vq = VectorQuantizeEnhanced(
-            vq_dim, codebook_size, decay=decay
+            hidden_dim, codebook_size, decay=decay
         )
 
-        # Post-VQ: project vq_dim → 1024
-        self.post_vq = nn.Sequential(
-            nn.Linear(vq_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
-
+        # Near-identity init (same as exp 81's content_proj)
         self._warm_start_init()
 
     def _warm_start_init(self):
-        """Initialize so that post_vq(pre_vq(x)) ≈ 0.
+        """Initialize pre_vq as near-identity.
 
-        Combined with residual warmup: output = hidden + α * VQ_path
-        At α=0: output = hidden → perfect reconstruction from step 0.
+        This is the KEY insight from exp 81:
+          pre_vq(x) ≈ x at init → VQ input ≈ hidden
+          → codebook initializes from meaningful data
+          → decoder sees good input from step 0
+          → smooth transition to quantized output via alpha
         """
-        # Post-VQ: near-zero output at init
-        for layer in self.post_vq:
+        for layer in self.pre_vq:
             if isinstance(layer, nn.Linear):
-                nn.init.uniform_(layer.weight, -1e-3, 1e-3)
+                nn.init.eye_(layer.weight)
                 nn.init.zeros_(layer.bias)
-            elif isinstance(layer, nn.LayerNorm):
-                nn.init.ones_(layer.weight)
-                nn.init.zeros_(layer.bias)
+                with torch.no_grad():
+                    layer.weight.add_(torch.randn_like(layer.weight) * 1e-3)
 
     @property
     def weight_dtype(self):
@@ -270,7 +260,7 @@ class SingleCodebookVQ(nn.Module):
         """
         Args:
             hidden: [B, T, 1024] from pre_transformer (frozen).
-            vq_alpha: 0→1 blend factor (0=bypass VQ, 1=fully quantized).
+            vq_alpha: 0→1 blend factor (0=continuous, 1=fully quantized).
 
         Returns:
             output: [B, T, 1024] for decoder.
@@ -280,52 +270,17 @@ class SingleCodebookVQ(nn.Module):
         """
         hidden = self._match_dtype(hidden)
 
-        # Project to VQ space
-        z = self.pre_vq(hidden)  # [B, T, vq_dim]
+        # Near-identity projection (≈ hidden at init)
+        z = self.pre_vq(hidden)  # [B, T, 1024]
 
         # Quantize
         z_q, tokens, vq_loss, metrics = self.vq(z)
 
-        # Blend in VQ space: smooth transition continuous → quantized
-        z_out = z + vq_alpha * (z_q - z)
-
-        # Project back to hidden dim
-        vq_decoded = self.post_vq(z_out)  # [B, T, 1024]
-
-        # Residual warmup: output = hidden + α * (vq_decoded - hidden)
-        # At α=0: output = hidden (decoder gets original → perfect recon)
-        # At α=1: output = vq_decoded (decoder gets VQ output)
-        output = hidden + vq_alpha * (vq_decoded - hidden)
-
-        # Entropy regularization: maximize codebook usage
-        # Computed from soft distance distribution
-        if self.training and self.entropy_weight > 0:
-            z_flat = z.reshape(-1, self.vq_dim).float()
-            cb = self.vq.embedding.weight.float()
-            dist = (
-                z_flat.pow(2).sum(1, keepdim=True)
-                + cb.pow(2).sum(1, keepdim=True).t()
-                - 2 * z_flat @ cb.t()
-            )
-            # Soft assignment probabilities
-            soft_probs = F.softmax(-dist * 10.0, dim=-1)
-            avg_probs = soft_probs.mean(0)
-            entropy = -(avg_probs * torch.log(avg_probs + 1e-10)).sum()
-            max_entropy = torch.log(
-                torch.tensor(
-                    float(self.codebook_size), device=hidden.device
-                )
-            )
-            # Normalize: 0 = no entropy, 1 = max entropy (uniform)
-            entropy_loss = (max_entropy - entropy) / max_entropy
-            vq_loss = (
-                self.commitment_weight * vq_loss
-                + self.entropy_weight * entropy_loss
-            )
-            metrics["entropy_loss"] = entropy_loss.item()
-            metrics["entropy_ratio"] = (entropy / max_entropy).item()
-        else:
-            vq_loss = self.commitment_weight * vq_loss
+        # SINGLE alpha blend — exactly like exp 81
+        # At α=0: output = z ≈ hidden (continuous, near-identity)
+        # At α=1: output = z_q (fully quantized)
+        # NO second alpha, NO post-projection
+        output = z + vq_alpha * (z_q - z)
 
         return output, tokens, vq_loss, metrics
 
@@ -338,5 +293,5 @@ class SingleCodebookVQ(nn.Module):
         Returns:
             output: [B, T, 1024] hidden states for decoder.
         """
-        z_q = self.vq.decode(tokens)  # [B, T, vq_dim]
-        return self.post_vq(z_q)      # [B, T, 1024]
+        # Direct codebook lookup — NO post-projection needed
+        return self.vq.decode(tokens)  # [B, T, 1024]

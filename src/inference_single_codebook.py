@@ -136,7 +136,7 @@ class SingleCodebookTokenizer:
         if svq_path.exists():
             svq_weights = load_file(str(svq_path))
             self.single_vq.load_state_dict(svq_weights)
-            print(f"  Loaded SingleCodebookVQ ✓ (codebook={codebook_size}, dim={vq_dim})")
+            print(f"  Loaded SingleCodebookVQ ✓ (codebook={codebook_size}, dim=1024)")
         else:
             print("  ⚠️  single_codebook_vq.safetensors not found!")
 
