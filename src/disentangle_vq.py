@@ -26,9 +26,6 @@ class VectorQuantize(nn.Module):
         self.embedding = nn.Embedding(codebook_size, dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / codebook_size, 1.0 / codebook_size)
 
-        # EMA tracking
-        self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
-        self.register_buffer("ema_embed_sum", self.embedding.weight.data.clone())
         self.register_buffer("initted", torch.tensor(False))
 
     def _init_from_data(self, x_flat):
@@ -39,8 +36,6 @@ class VectorQuantize(nn.Module):
         indices = torch.randperm(x_flat.shape[0], device=x_flat.device)[:n]
         data = x_flat[indices].detach().float()
         self.embedding.weight.data[:n] = data.to(self.embedding.weight.dtype)
-        self.ema_embed_sum.data[:n] = data.to(self.ema_embed_sum.dtype)
-        self.ema_cluster_size.data[:n] = 1.0
         self.initted.fill_(True)
 
     def forward(self, x):
@@ -56,27 +51,6 @@ class VectorQuantize(nn.Module):
         dist = torch.cdist(x_flat, self.embedding.weight.float())
         indices = dist.argmin(dim=-1)
         quantized = self.embedding(indices).to(x.dtype)
-
-        # EMA codebook update (all in float32, then cast back)
-        if self.training:
-            one_hot = F.one_hot(indices, self.codebook_size).float()
-            cluster_size = one_hot.sum(0)
-            embed_sum = (one_hot.t() @ x_flat).float()
-
-            # Do EMA in float32 to avoid bf16 lerp_ mismatch
-            ema_cs = self.ema_cluster_size.float()
-            ema_es = self.ema_embed_sum.float()
-            ema_cs.lerp_(cluster_size, 1 - self.decay)
-            ema_es.lerp_(embed_sum, 1 - self.decay)
-            self.ema_cluster_size.copy_(ema_cs)
-            self.ema_embed_sum.copy_(ema_es)
-
-            n = ema_cs.sum()
-            cluster_size_smoothed = (
-                (ema_cs + self.eps) / (n + self.codebook_size * self.eps) * n
-            )
-            new_weights = ema_es / cluster_size_smoothed.unsqueeze(1)
-            self.embedding.weight.data.copy_(new_weights.to(self.embedding.weight.dtype))
 
         # Losses
         commitment_loss = F.mse_loss(x_flat, quantized.detach().float())
