@@ -88,6 +88,7 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 )
 
 from disentangle import DisentangledProjection
+from disentangle_vq import DisentangledVQ
 
 BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
 
@@ -367,6 +368,12 @@ def parse_args():
         default=4,
         help="Number of nearest neighbors for self-prematching.",
     )
+    parser.add_argument(
+        "--lambda_vq",
+        type=float,
+        default=1.0,
+        help="VQ commitment loss weight for content+speaker codebooks.",
+    )
 
     # Architecture
     parser.add_argument(
@@ -531,11 +538,10 @@ def knn_self_prematch(hidden, k=4, prematch_prob=0.5):
 
 
 class DecoderTrainingWrapper(nn.Module):
-    """Wraps Qwen3TTSTokenizerV2Decoder for efficient training.
+    """Wraps Qwen3TTSTokenizerV2Decoder with DisentangledVQ.
 
-    Supports kNN self-prematching: during training, randomly replace hidden
-    frames with their nearest neighbors from the same utterance. This teaches
-    the decoder to handle frame substitution, enabling kNN-VC at inference.
+    2-codebook tokenizer: content VQ (per-frame) + speaker VQ (global).
+    Voice conversion = swap speaker token → decode.
     """
 
     def __init__(
@@ -551,86 +557,76 @@ class DecoderTrainingWrapper(nn.Module):
         self.decoder = decoder
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
-        self.prematch_k = prematch_k
-        self.prematch_prob = prematch_prob
 
-        # Keep DisentangledProjection for backward compat (set all lambdas=0 to disable)
-        hidden_dim = 1024
-        self.disentangle = DisentangledProjection(
-            hidden_dim, speaker_dim=speaker_dim,
+        # 2-codebook VQ: content (per-frame) + speaker (global)
+        self.disentangle_vq = DisentangledVQ(
+            hidden_dim=1024,
+            content_codebook_size=1024,
+            speaker_codebook_size=512,
+            speaker_dim=speaker_dim,
         )
+
+        # Keep old DisentangledProjection for checkpoint compat (not used in forward)
+        self.disentangle = DisentangledProjection(1024, speaker_dim=speaker_dim)
+
+        # Stored for loss computation
         self.last_content_emb = None
         self.last_speaker_emb = None
         self.last_speaker_global = None
         self.last_original_hidden = None
+        self.last_vq_loss = None
+        self.last_content_tokens = None
+        self.last_speaker_tokens = None
 
-    def forward(self, codes):
+    def _decode_hidden(self, hidden):
+        """Run hidden through upsample + decoder blocks."""
+        hidden = hidden.permute(0, 2, 1)
+        for blocks in self.decoder.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+        wav = hidden
+        if self.train_full_decoder:
+            for block in self.decoder.decoder:
+                wav = block(wav)
+        else:
+            for block in self.decoder.decoder[: self.num_frozen]:
+                wav = block(wav)
+            for block in self.decoder.decoder[self.num_frozen :]:
+                wav = block(wav)
+        return wav
+
+    def forward(self, codes, vq_alpha=1.0):
         if codes.shape[1] != self.decoder.config.num_quantizers:
             raise ValueError(
                 f"Expected {self.decoder.config.num_quantizers} layers of codes, "
                 f"got {codes.shape[1]}"
             )
 
-        if self.train_full_decoder:
+        # Encode (frozen)
+        with torch.no_grad():
             hidden = self.decoder.quantizer.decode(codes)
             hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
             hidden = self.decoder.pre_transformer(
                 inputs_embeds=hidden
             ).last_hidden_state
 
-            self.last_original_hidden = hidden.detach()
+        self.last_original_hidden = hidden.detach()
 
-            # kNN self-prematch during training
-            if self.training and self.prematch_prob > 0:
-                hidden = knn_self_prematch(hidden, k=self.prematch_k, prematch_prob=self.prematch_prob)
+        # DisentangledVQ: content + speaker quantization
+        combined, content_tokens, speaker_tokens, vq_loss, speaker_global = (
+            self.disentangle_vq(hidden, vq_alpha=vq_alpha)
+        )
 
-            # Store dummy disentangle values for loss compat
-            self.last_content_emb = hidden
-            self.last_speaker_emb = torch.zeros_like(hidden)
-            self.last_speaker_global = torch.zeros(
-                hidden.shape[0], 256, device=hidden.device, dtype=hidden.dtype
-            )
+        # Store for loss computation
+        self.last_content_emb = combined
+        self.last_speaker_emb = torch.zeros_like(combined)
+        self.last_speaker_global = speaker_global
+        self.last_vq_loss = vq_loss
+        self.last_content_tokens = content_tokens
+        self.last_speaker_tokens = speaker_tokens
 
-            hidden = hidden.permute(0, 2, 1)
-            for blocks in self.decoder.upsample:
-                for block in blocks:
-                    hidden = block(hidden)
-            wav = hidden
-            for block in self.decoder.decoder:
-                wav = block(wav)
-        else:
-            # Frozen encoder
-            with torch.no_grad():
-                hidden = self.decoder.quantizer.decode(codes)
-                hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
-                hidden = self.decoder.pre_transformer(
-                    inputs_embeds=hidden
-                ).last_hidden_state
-
-            self.last_original_hidden = hidden.detach()
-
-            # kNN self-prematch during training
-            if self.training and self.prematch_prob > 0:
-                hidden = knn_self_prematch(hidden, k=self.prematch_k, prematch_prob=self.prematch_prob)
-
-            # Store dummy disentangle values for loss compat
-            self.last_content_emb = hidden
-            self.last_speaker_emb = torch.zeros_like(hidden)
-            self.last_speaker_global = torch.zeros(
-                hidden.shape[0], 256, device=hidden.device, dtype=hidden.dtype
-            )
-
-            # Decoder (frozen blocks pass gradients through for prematch learning)
-            hidden = hidden.permute(0, 2, 1)
-            for blocks in self.decoder.upsample:
-                for block in blocks:
-                    hidden = block(hidden)
-            wav = hidden
-            for block in self.decoder.decoder[: self.num_frozen]:
-                wav = block(wav)
-            for block in self.decoder.decoder[self.num_frozen :]:
-                wav = block(wav)
-
+        # Decode
+        wav = self._decode_hidden(combined)
         return wav.clamp(min=-1, max=1)
 
 
@@ -723,14 +719,18 @@ def create_model(args, accelerator):
         prematch_prob=getattr(args, 'prematch_prob', 0.5),
     )
 
-    # DisentangledProjection is always trainable
+    # DisentangledProjection + DisentangledVQ are always trainable
     dis_params = sum(p.numel() for p in wrapper.disentangle.parameters())
-    total_trainable = trainable_decoder + dis_params
+    vq_params = sum(p.numel() for p in wrapper.disentangle_vq.parameters())
+    total_trainable = trainable_decoder + dis_params + vq_params
     accelerator.print(
-        f"DisentangledProjection: {dis_params:,} params (all trainable)"
+        f"DisentangledProjection: {dis_params:,} params"
     )
     accelerator.print(
-        f"Total trainable: {total_trainable:,} (decoder: {trainable_decoder:,} + disentangle: {dis_params:,})"
+        f"DisentangledVQ: {vq_params:,} params (content+speaker codebooks)"
+    )
+    accelerator.print(
+        f"Total trainable: {total_trainable:,}"
     )
 
     # Load weights from checkpoint
@@ -771,6 +771,7 @@ def create_model(args, accelerator):
 
     # Cast DisentangledProjection to bf16 to match model dtype under mixed precision
     wrapper.disentangle = wrapper.disentangle.to(torch.bfloat16)
+    wrapper.disentangle_vq = wrapper.disentangle_vq.to(torch.bfloat16)
 
     return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
 
@@ -961,12 +962,19 @@ def save_checkpoint(
                 trainable_state_dict[k] = v.cpu()
     save_file(trainable_state_dict, str(checkpoint_dir / "decoder_block.safetensors"))
 
-    # DisentangledProjection weights (needed for voice conversion inference)
+    # DisentangledProjection weights (backward compat)
     if hasattr(unwrapped_model, "disentangle"):
         disentangle_state = {
             k: v.cpu() for k, v in unwrapped_model.disentangle.state_dict().items()
         }
         save_file(disentangle_state, str(checkpoint_dir / "disentangle.safetensors"))
+
+    # DisentangledVQ weights (2-codebook tokenizer)
+    if hasattr(unwrapped_model, "disentangle_vq"):
+        vq_state = {
+            k: v.cpu() for k, v in unwrapped_model.disentangle_vq.state_dict().items()
+        }
+        save_file(vq_state, str(checkpoint_dir / "disentangle_vq.safetensors"))
 
     # Discriminator weights (only when GAN is enabled)
     if args.use_gan and mpd is not None and msd is not None:
@@ -1351,8 +1359,12 @@ def main():
             target_audio = batch["audio"].to(accelerator.device)
             audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
+            # VQ alpha: linearly ramp from 0 (continuous) to 1 (fully quantized)
+            vq_warmup = max(args.disentangle_warmup_steps, 500)
+            vq_alpha = min(1.0, global_step / vq_warmup) if vq_warmup > 0 else 1.0
+
             # Generator forward
-            pred_48k = model(audio_codes)
+            pred_48k = model(audio_codes, vq_alpha=vq_alpha)
 
             # Align shapes for loss computation
             pred, target, min_len = align_audio(pred_48k, target_audio)
@@ -1571,6 +1583,11 @@ def main():
                 else:
                     loss_speaker_div = content_emb.new_zeros(())
 
+                # VQ commitment loss
+                vq_loss = unwrapped_model.last_vq_loss
+                if vq_loss is None:
+                    vq_loss = content_emb.new_zeros(())
+
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
@@ -1582,6 +1599,7 @@ def main():
                     + dis_ramp * args.lambda_cycle * loss_cycle
                     + dis_ramp * args.lambda_speaker_adv * loss_speaker_adv
                     + dis_ramp * args.lambda_speaker_div * loss_speaker_div
+                    + args.lambda_vq * vq_loss
                 )
 
                 # =====================

@@ -11,17 +11,15 @@ OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
 RUN_NUMBER=91
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# PREMATCHED DECODER TRAINING (from kNN-VC paper, Baas et al. 2023):
+# 2-CODEBOOK DISENTANGLED TOKENIZER:
 #
-# During training, randomly replace hidden frames with nearest neighbors
-# from the same utterance (self-prematching). This teaches the decoder
-# to handle frame-level substitution.
+# Content VQ: per-frame quantization (1024 codes). Shared codebook across
+#   all speakers → speaker info gets quantized away.
+# Speaker VQ: global attention-pooled quantization (512 codes). Pools across
+#   time → content info gets averaged away.
 #
-# At inference: kNN match source frames against TARGET speaker's features.
-# The decoder handles this cleanly because it was trained on matched features.
-#
-# All disentanglement losses disabled (lambda=0). No speaker/content split.
-# The kNN handles speaker transfer at inference time — no training needed.
+# Voice conversion: keep source content tokens, swap speaker token → decode.
+# VQ alpha ramps 0→1 over 500 steps (warm start: continuous first, then VQ).
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -55,6 +53,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_global_rms    5.0  \
     --lambda_d_mpd         0.01 \
     --lambda_d_msd         0.1  \
+    --lambda_vq            1.0  \
     --lambda_orth          0.0  \
     --lambda_consistency   0.0  \
     --lambda_speaker_id    0.0  \
@@ -62,8 +61,8 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_speaker_adv   0.0  \
     --lambda_speaker_div   0.0  \
     --content_dropout      0.0  \
-    --disentangle_warmup_steps 0 \
-    --prematch_prob        0.5  \
+    --disentangle_warmup_steps 500 \
+    --prematch_prob        0.0  \
     --prematch_k           4    \
     \
     --spike_skip_threshold 3.0 \
@@ -71,4 +70,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-kNN-Prematch"
+    --wandb_run_name "Run${RUN_NUMBER}-2Codebook-VQ"
