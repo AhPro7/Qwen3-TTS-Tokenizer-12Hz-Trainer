@@ -89,6 +89,7 @@ from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 
 from disentangle import DisentangledProjection
 from disentangle_vq import DisentangledVQ
+from single_codebook_vq import SingleCodebookVQ
 
 BASE_SAMPLE_RATE = 24_000  # Hz, base Qwen3-TTS-Tokenizer output rate
 
@@ -375,6 +376,36 @@ def parse_args():
         help="VQ commitment loss weight for content+speaker codebooks.",
     )
 
+    # ── Experiment 95: Single Codebook VQ ──────────────────────────────────
+    parser.add_argument(
+        "--single_codebook",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experiment 95: Replace 16 RVQ codebooks with a single large codebook. "
+            "Produces ONE discrete token per frame at 12.5Hz. "
+            "Disables all speaker disentanglement losses."
+        ),
+    )
+    parser.add_argument(
+        "--codebook_size",
+        type=int,
+        default=16384,
+        help="Single codebook size (default: 16384). Only used with --single_codebook.",
+    )
+    parser.add_argument(
+        "--vq_dim",
+        type=int,
+        default=256,
+        help="VQ quantization dimension (default: 256). Only used with --single_codebook.",
+    )
+    parser.add_argument(
+        "--entropy_weight",
+        type=float,
+        default=0.1,
+        help="Entropy regularization weight to maximize codebook usage.",
+    )
+
     # Architecture
     parser.add_argument(
         "--speaker_dim",
@@ -538,10 +569,11 @@ def knn_self_prematch(hidden, k=4, prematch_prob=0.5):
 
 
 class DecoderTrainingWrapper(nn.Module):
-    """Wraps Qwen3TTSTokenizerV2Decoder with DisentangledVQ.
+    """Wraps Qwen3TTSTokenizerV2Decoder with VQ bottleneck.
 
-    2-codebook tokenizer: content VQ (per-frame) + speaker VQ (global).
-    Voice conversion = swap speaker token → decode.
+    Supports two modes:
+      - Disentangled (default): 2-codebook VQ (content + speaker).
+      - Single codebook (--single_codebook): ONE token per frame, pure reconstruction.
     """
 
     def __init__(
@@ -552,19 +584,33 @@ class DecoderTrainingWrapper(nn.Module):
         speaker_dim: int = 256,
         prematch_k: int = 4,
         prematch_prob: float = 0.5,
+        single_codebook: bool = False,
+        codebook_size: int = 16384,
+        vq_dim: int = 256,
+        entropy_weight: float = 0.1,
     ):
         super().__init__()
         self.decoder = decoder
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
+        self.single_codebook = single_codebook
 
-        # 2-codebook VQ: content (per-frame) + speaker (global)
-        self.disentangle_vq = DisentangledVQ(
-            hidden_dim=1024,
-            content_codebook_size=1024,
-            speaker_codebook_size=512,
-            speaker_dim=speaker_dim,
-        )
+        if single_codebook:
+            # Experiment 95: Single codebook VQ — ONE token per frame
+            self.single_vq = SingleCodebookVQ(
+                hidden_dim=1024,
+                vq_dim=vq_dim,
+                codebook_size=codebook_size,
+                entropy_weight=entropy_weight,
+            )
+        else:
+            # 2-codebook VQ: content (per-frame) + speaker (global)
+            self.disentangle_vq = DisentangledVQ(
+                hidden_dim=1024,
+                content_codebook_size=1024,
+                speaker_codebook_size=512,
+                speaker_dim=speaker_dim,
+            )
 
         # Keep old DisentangledProjection for checkpoint compat (not used in forward)
         self.disentangle = DisentangledProjection(1024, speaker_dim=speaker_dim)
@@ -577,6 +623,7 @@ class DecoderTrainingWrapper(nn.Module):
         self.last_vq_loss = None
         self.last_content_tokens = None
         self.last_speaker_tokens = None
+        self.last_vq_metrics = {}
 
     def _decode_hidden(self, hidden):
         """Run hidden through upsample + decoder blocks."""
@@ -612,21 +659,34 @@ class DecoderTrainingWrapper(nn.Module):
 
         self.last_original_hidden = hidden.detach()
 
-        # DisentangledVQ: content + speaker quantization
-        combined, content_tokens, speaker_tokens, vq_loss, speaker_global = (
-            self.disentangle_vq(hidden, vq_alpha=vq_alpha)
-        )
-
-        # Store for loss computation
-        self.last_content_emb = combined
-        self.last_speaker_emb = torch.zeros_like(combined)
-        self.last_speaker_global = speaker_global
-        self.last_vq_loss = vq_loss
-        self.last_content_tokens = content_tokens
-        self.last_speaker_tokens = speaker_tokens
+        if self.single_codebook:
+            # ── Experiment 95: Single Codebook VQ ──
+            output, tokens, vq_loss, metrics = self.single_vq(
+                hidden, vq_alpha=vq_alpha
+            )
+            self.last_content_emb = output
+            self.last_speaker_emb = torch.zeros_like(output)
+            self.last_speaker_global = output.new_zeros(output.shape[0], 256)
+            self.last_vq_loss = vq_loss
+            self.last_content_tokens = tokens
+            self.last_speaker_tokens = None
+            self.last_vq_metrics = metrics
+        else:
+            # ── Disentangled 2-codebook VQ ──
+            combined, content_tokens, speaker_tokens, vq_loss, speaker_global = (
+                self.disentangle_vq(hidden, vq_alpha=vq_alpha)
+            )
+            self.last_content_emb = combined
+            self.last_speaker_emb = torch.zeros_like(combined)
+            self.last_speaker_global = speaker_global
+            self.last_vq_loss = vq_loss
+            self.last_content_tokens = content_tokens
+            self.last_speaker_tokens = speaker_tokens
+            self.last_vq_metrics = {}
+            output = combined
 
         # Decode
-        wav = self._decode_hidden(combined)
+        wav = self._decode_hidden(output)
         return wav.clamp(min=-1, max=1)
 
 
@@ -717,21 +777,50 @@ def create_model(args, accelerator):
         speaker_dim=args.speaker_dim,
         prematch_k=getattr(args, 'prematch_k', 4),
         prematch_prob=getattr(args, 'prematch_prob', 0.5),
+        single_codebook=getattr(args, 'single_codebook', False),
+        codebook_size=getattr(args, 'codebook_size', 16384),
+        vq_dim=getattr(args, 'vq_dim', 256),
+        entropy_weight=getattr(args, 'entropy_weight', 0.1),
     )
 
-    # DisentangledProjection + DisentangledVQ are always trainable
+    # Print trainable parameter counts
     dis_params = sum(p.numel() for p in wrapper.disentangle.parameters())
-    vq_params = sum(p.numel() for p in wrapper.disentangle_vq.parameters())
-    total_trainable = trainable_decoder + dis_params + vq_params
-    accelerator.print(
-        f"DisentangledProjection: {dis_params:,} params"
-    )
-    accelerator.print(
-        f"DisentangledVQ: {vq_params:,} params (content+speaker codebooks)"
-    )
-    accelerator.print(
-        f"Total trainable: {total_trainable:,}"
-    )
+    if args.single_codebook:
+        vq_params = sum(p.numel() for p in wrapper.single_vq.parameters())
+        total_trainable = trainable_decoder + dis_params + vq_params
+        accelerator.print(
+            f"╔═══ Experiment 95: Single Codebook VQ ═══╗"
+        )
+        accelerator.print(
+            f"║  Codebook size: {args.codebook_size:,}  VQ dim: {args.vq_dim}"
+        )
+        accelerator.print(
+            f"║  Tokens: 1 per frame @ 12.5 Hz"
+        )
+        accelerator.print(
+            f"║  Bitrate: {int(torch.tensor(float(args.codebook_size)).log2().item() * 12.5)} bits/sec"
+        )
+        accelerator.print(
+            f"║  SingleCodebookVQ: {vq_params:,} params"
+        )
+        accelerator.print(
+            f"║  Total trainable: {total_trainable:,}"
+        )
+        accelerator.print(
+            f"╚══════════════════════════════════════════╝"
+        )
+    else:
+        vq_params = sum(p.numel() for p in wrapper.disentangle_vq.parameters())
+        total_trainable = trainable_decoder + dis_params + vq_params
+        accelerator.print(
+            f"DisentangledProjection: {dis_params:,} params"
+        )
+        accelerator.print(
+            f"DisentangledVQ: {vq_params:,} params (content+speaker codebooks)"
+        )
+        accelerator.print(
+            f"Total trainable: {total_trainable:,}"
+        )
 
     # Load weights from checkpoint
     if args.resume_from:
@@ -750,7 +839,7 @@ def create_model(args, accelerator):
                 f"WARNING: decoder_block.safetensors not found at {checkpoint_path}"
             )
 
-        # Load DisentangledProjection weights (critical fix: was missing before)
+        # Load DisentangledProjection weights (backward compat)
         dis_path = Path(args.resume_from) / "disentangle.safetensors"
         if dis_path.exists():
             accelerator.print(f"Loading DisentangledProjection from {dis_path}...")
@@ -769,9 +858,31 @@ def create_model(args, accelerator):
                 "starting DisentangledProjection from warm-start init."
             )
 
-    # Cast DisentangledProjection to bf16 to match model dtype under mixed precision
+        # Load SingleCodebookVQ weights (Experiment 95)
+        if args.single_codebook:
+            svq_path = Path(args.resume_from) / "single_codebook_vq.safetensors"
+            if svq_path.exists():
+                accelerator.print(f"Loading SingleCodebookVQ from {svq_path}...")
+                try:
+                    svq_weights = load_file(str(svq_path))
+                    wrapper.single_vq.load_state_dict(svq_weights, strict=False)
+                    accelerator.print("SingleCodebookVQ weights loaded ✓")
+                except Exception as e:
+                    accelerator.print(
+                        f"WARNING: SingleCodebookVQ load failed: {e}\n"
+                        f"Starting from scratch."
+                    )
+            else:
+                accelerator.print(
+                    "SingleCodebookVQ: no checkpoint found — starting fresh."
+                )
+
+    # Cast to bf16 to match model dtype under mixed precision
     wrapper.disentangle = wrapper.disentangle.to(torch.bfloat16)
-    wrapper.disentangle_vq = wrapper.disentangle_vq.to(torch.bfloat16)
+    if args.single_codebook:
+        wrapper.single_vq = wrapper.single_vq.to(torch.bfloat16)
+    else:
+        wrapper.disentangle_vq = wrapper.disentangle_vq.to(torch.bfloat16)
 
     return wrapper, num_frozen, base_upsample_rates, new_upsample_rates
 
@@ -976,6 +1087,13 @@ def save_checkpoint(
         }
         save_file(vq_state, str(checkpoint_dir / "disentangle_vq.safetensors"))
 
+    # SingleCodebookVQ weights (Experiment 95)
+    if hasattr(unwrapped_model, "single_vq"):
+        svq_state = {
+            k: v.cpu() for k, v in unwrapped_model.single_vq.state_dict().items()
+        }
+        save_file(svq_state, str(checkpoint_dir / "single_codebook_vq.safetensors"))
+
     # Discriminator weights (only when GAN is enabled)
     if args.use_gan and mpd is not None and msd is not None:
         unwrapped_mpd = accelerator.unwrap_model(mpd)
@@ -1029,6 +1147,10 @@ def save_checkpoint(
         "beta2_d": args.beta2_d,
         "r1": args.r1,
         "d_reg_every": args.d_reg_every,
+        "single_codebook": getattr(args, 'single_codebook', False),
+        "codebook_size": getattr(args, 'codebook_size', 16384),
+        "vq_dim": getattr(args, 'vq_dim', 256),
+        "entropy_weight": getattr(args, 'entropy_weight', 0.1),
     }
     with open(checkpoint_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
@@ -1721,6 +1843,20 @@ def main():
                                 "d/r1_loss": r1_loss_val,
                             }
                         )
+                    # Single Codebook VQ metrics (Experiment 95)
+                    unwrapped_for_log = accelerator.unwrap_model(model)
+                    if getattr(unwrapped_for_log, 'single_codebook', False):
+                        vq_metrics = unwrapped_for_log.last_vq_metrics
+                        if vq_metrics:
+                            log_dict.update({
+                                "vq/codebook_usage": vq_metrics.get("codebook_usage", 0),
+                                "vq/unique_codes": vq_metrics.get("unique_codes", 0),
+                                "vq/perplexity": vq_metrics.get("perplexity", 0),
+                                "vq/dead_codes": vq_metrics.get("dead_codes", 0),
+                                "vq/entropy_loss": vq_metrics.get("entropy_loss", 0),
+                                "vq/entropy_ratio": vq_metrics.get("entropy_ratio", 0),
+                            })
+                        log_dict["vq/alpha"] = vq_alpha
                     accelerator.log(log_dict, step=global_step)
 
                     progress_bar.set_postfix(
@@ -1755,6 +1891,7 @@ def main():
                     accelerator.log(val_losses, step=global_step)
 
                     # Log Voice Conversion Table to W&B
+                    # (Skip in single_codebook mode — no speaker disentanglement)
                     # 5-column table (all audio):
                     #   1. Original Speaker Audio (ground truth)
                     #   2. Original Speaker Reconstruction (model output)
@@ -1762,7 +1899,10 @@ def main():
                     #   4. Target Speaker Reconstruction (model output)
                     #   5. Converted Output (content from original + voice from target)
                     # 3 rows of in-batch speaker swap demos
-                    if accelerator.is_main_process:
+                    is_single_cb = getattr(
+                        accelerator.unwrap_model(model), 'single_codebook', False
+                    )
+                    if accelerator.is_main_process and not is_single_cb:
                         try:
                             import wandb
                             sample_batch = next(iter(val_dataloader))

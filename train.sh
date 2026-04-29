@@ -8,18 +8,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=91
+RUN_NUMBER=95
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# 2-CODEBOOK DISENTANGLED TOKENIZER:
+# EXPERIMENT 95: SINGLE CODEBOOK VQ
 #
-# Content VQ: per-frame quantization (1024 codes). Shared codebook across
-#   all speakers → speaker info gets quantized away.
-# Speaker VQ: global attention-pooled quantization (512 codes). Pools across
-#   time → content info gets averaged away.
+# Merge 16 RVQ codebooks into ONE large codebook (16384 codes).
+# Produces ONE discrete token per frame at 12.5 Hz.
+# Pure reconstruction — no speaker disentanglement.
 #
-# Voice conversion: keep source content tokens, swap speaker token → decode.
-# VQ alpha ramps 0→1 over 500 steps (warm start: continuous first, then VQ).
+# Architecture:
+#   frozen encoder → hidden [B, T, 1024]
+#     → LayerNorm + MLP(1024 → 256)  [pre_vq_proj]
+#     → VQ(dim=256, size=16384)      [single codebook]
+#     → MLP(256 → 1024) + LayerNorm  [post_vq_proj]
+#     → upsample + decoder blocks → waveform
+#
+# VQ alpha ramps 0→1 over 1000 steps (warm start: continuous first, then VQ).
+# Entropy regularization prevents codebook collapse.
+# Dead code reset reinitializes unused codes from batch data.
+#
+# Bitrate: log2(16384) * 12.5 = 175 bits/sec
+# (vs. 16 * 10 * 12.5 = 2000 bits/sec for 16-codebook RVQ)
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
@@ -27,24 +37,29 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
     \
+    --single_codebook \
+    --codebook_size 16384 \
+    --vq_dim 256 \
+    --entropy_weight 0.1 \
+    \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
     --max_audio_length 7.0 \
     --min_audio_length 1.0 \
     \
-    --lr_g 1e-4 \
+    --lr_g 2e-4 \
     --lr_d 2e-4 \
     --beta1_g 0.8 \
     --beta2_g 0.99 \
     --beta1_d 0.8 \
     --beta2_d 0.99 \
-    --warmup_steps 300 \
+    --warmup_steps 500 \
     --weight_decay 0.01 \
     --max_grad_norm 1.0 \
     \
-    --max_train_steps 10000 \
-    --save_every 500 \
-    --eval_every 100 \
+    --max_train_steps 20000 \
+    --save_every 1000 \
+    --eval_every 200 \
     --log_every 5 \
     \
     --lambda_adv           0.3  \
@@ -61,7 +76,7 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_speaker_adv   0.0  \
     --lambda_speaker_div   0.0  \
     --content_dropout      0.0  \
-    --disentangle_warmup_steps 500 \
+    --disentangle_warmup_steps 1000 \
     --prematch_prob        0.0  \
     --prematch_k           4    \
     \
@@ -70,4 +85,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-2Codebook-VQ"
+    --wandb_run_name "Run${RUN_NUMBER}-SingleCodebook-16384"
