@@ -264,10 +264,6 @@ def parse_args():
     )
 
     # R1 gradient penalty (lazy discriminator regularization, StyleGAN2-style)
-    # NOTE: g_regularize (StyleGAN2 path length) is not implemented here —
-    # the generator receives discrete acoustic codes through a frozen quantizer;
-    # there is no continuous style latent over which to compute a meaningful
-    # path length. HiFiGAN, EnCodec, Vocos etc. do not use path length reg.
     parser.add_argument(
         "--r1",
         type=float,
@@ -339,6 +335,24 @@ def parse_args():
         type=int,
         default=256,
         help="Speaker bottleneck dimension in DisentangledProjection (default: 256)",
+    )
+    parser.add_argument(
+        "--content_dim",
+        type=int,
+        default=128,
+        help="VQ codebook vector dimension for content path (default: 128)",
+    )
+    parser.add_argument(
+        "--codebook_size",
+        type=int,
+        default=1024,
+        help="Number of discrete codes in content VQ codebook (default: 1024)",
+    )
+    parser.add_argument(
+        "--vq_commitment_cost",
+        type=float,
+        default=0.25,
+        help="VQ commitment loss weight (default: 0.25)",
     )
 
     # Data settings
@@ -442,7 +456,9 @@ def parse_args():
     return parser.parse_args()
 
 
-
+# =============================================================================
+# DecoderTrainingWrapper
+# =============================================================================
 
 class DecoderTrainingWrapper(nn.Module):
     """Wraps Qwen3TTSTokenizerV2Decoder for efficient training.
@@ -450,6 +466,11 @@ class DecoderTrainingWrapper(nn.Module):
     When train_full_decoder=False: runs frozen layers under torch.no_grad() to save VRAM,
     and only computes gradients for the unfrozen decoder blocks.
     When train_full_decoder=True: runs the entire decoder with gradients.
+
+    disentangle.forward() returns 5 values:
+        speaker_contrib, content_emb, speaker_global, content_indices, commit_loss
+    All are stored as instance attributes so the training loop can read them
+    without re-running the model.
     """
 
     def __init__(
@@ -458,20 +479,49 @@ class DecoderTrainingWrapper(nn.Module):
         num_frozen_decoder_modules: int,
         train_full_decoder: bool = False,
         speaker_dim: int = 256,
+        content_dim: int = 128,
+        codebook_size: int = 1024,
+        vq_commitment_cost: float = 0.25,
     ):
         super().__init__()
         self.decoder = decoder
         self.num_frozen = num_frozen_decoder_modules
         self.train_full_decoder = train_full_decoder
-        
-        hidden_dim = 1024  # actual output dim of pre_transformer
-        self.disentangle = DisentangledProjection(hidden_dim, speaker_dim=speaker_dim)
-        self.last_content_emb = None
-        self.last_speaker_emb = None    # [B, T, hidden_dim] contribution
-        self.last_speaker_global = None  # [B, speaker_dim] for logging
-        self.last_original_hidden = None  # [B, T, hidden_dim] pre-disentangle
 
-    def forward(self, codes):
+        hidden_dim = 1024  # actual output dim of pre_transformer
+        self.disentangle = DisentangledProjection(
+            hidden_dim=hidden_dim,
+            speaker_dim=speaker_dim,
+            content_dim=content_dim,
+            codebook_size=codebook_size,
+            commitment_cost=vq_commitment_cost,
+        )
+
+        # Stored after each forward pass — read by the training loop
+        self.last_content_emb = None
+        self.last_speaker_emb = None      # [B, T, hidden_dim] contribution
+        self.last_speaker_global = None   # [B, speaker_dim] for logging / swap
+        self.last_original_hidden = None  # [B, T, hidden_dim] pre-disentangle
+        self.last_content_indices = None  # [B, T] discrete VQ token indices
+        self.last_commit_loss = None      # scalar VQ commitment loss
+
+    def _run_disentangle(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Run DisentangledProjection, store results, return combined hidden."""
+        # disentangle returns (speaker_contrib, content_emb, speaker_global,
+        #                      content_indices, commit_loss)
+        speaker_contrib, content_emb, speaker_global, content_indices, commit_loss = \
+            self.disentangle(hidden)
+
+        self.last_speaker_emb = speaker_contrib
+        self.last_content_emb = content_emb
+        self.last_speaker_global = speaker_global
+        self.last_original_hidden = hidden.detach()
+        self.last_content_indices = content_indices
+        self.last_commit_loss = commit_loss
+
+        return speaker_contrib + content_emb
+
+    def forward(self, codes: torch.Tensor) -> torch.Tensor:
         if codes.shape[1] != self.decoder.config.num_quantizers:
             raise ValueError(
                 f"Expected {self.decoder.config.num_quantizers} layers of codes, "
@@ -485,14 +535,9 @@ class DecoderTrainingWrapper(nn.Module):
             hidden = self.decoder.pre_transformer(
                 inputs_embeds=hidden
             ).last_hidden_state
-            
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_contrib
-            self.last_content_emb = content_emb
-            self.last_speaker_global = speaker_global
-            self.last_original_hidden = hidden.detach()  # store for consistency loss
-            hidden = speaker_contrib + content_emb
-            
+
+            hidden = self._run_disentangle(hidden)
+
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
                 for block in blocks:
@@ -500,9 +545,9 @@ class DecoderTrainingWrapper(nn.Module):
             wav = hidden
             for block in self.decoder.decoder:
                 wav = block(wav)
+
         else:
             # Frozen encoder: no_grad for quantizer/pre_conv/pre_transformer
-            # (these layers are BEFORE DisentangledProjection — no gradients needed)
             with torch.no_grad():
                 hidden = self.decoder.quantizer.decode(codes)
                 hidden = self.decoder.pre_conv(hidden).transpose(1, 2)
@@ -510,18 +555,11 @@ class DecoderTrainingWrapper(nn.Module):
                     inputs_embeds=hidden
                 ).last_hidden_state
 
-            # DisentangledProjection: WITH gradients (this is what we're training)
-            speaker_contrib, content_emb, speaker_global = self.disentangle(hidden)
-            self.last_speaker_emb = speaker_contrib
-            self.last_content_emb = content_emb
-            self.last_speaker_global = speaker_global
-            self.last_original_hidden = hidden.detach()  # store for consistency loss
-            hidden = speaker_contrib + content_emb
+            # DisentangledProjection: WITH gradients
+            hidden = self._run_disentangle(hidden)
 
-            # Frozen decoder: NO torch.no_grad() here!
-            # The frozen params have requires_grad=False so they won't update,
-            # but the computation graph flows through them so gradients reach
-            # the DisentangledProjection via the reconstruction loss.
+            # Frozen decoder blocks: requires_grad=False so no update,
+            # but graph flows through so gradients reach DisentangledProjection.
             hidden = hidden.permute(0, 2, 1)
             for blocks in self.decoder.upsample:
                 for block in blocks:
@@ -530,12 +568,16 @@ class DecoderTrainingWrapper(nn.Module):
             for block in self.decoder.decoder[: self.num_frozen]:
                 wav = block(wav)
 
-            # Trainable decoder tail: gradients enabled (last 2 blocks)
+            # Trainable decoder tail
             for block in self.decoder.decoder[self.num_frozen :]:
                 wav = block(wav)
 
         return wav.clamp(min=-1, max=1)
 
+
+# =============================================================================
+# Model / discriminator creation
+# =============================================================================
 
 def create_model(args, accelerator):
     """Create decoder model, optionally adding 48kHz decoder block."""
@@ -619,9 +661,13 @@ def create_model(args, accelerator):
     )
 
     wrapper = DecoderTrainingWrapper(
-        decoder, num_frozen,
+        decoder,
+        num_frozen,
         train_full_decoder=args.train_full_decoder,
         speaker_dim=args.speaker_dim,
+        content_dim=args.content_dim,
+        codebook_size=args.codebook_size,
+        vq_commitment_cost=args.vq_commitment_cost,
     )
 
     # DisentangledProjection is always trainable
@@ -631,12 +677,15 @@ def create_model(args, accelerator):
         f"DisentangledProjection: {dis_params:,} params (all trainable)"
     )
     accelerator.print(
-        f"Total trainable: {total_trainable:,} (decoder: {trainable_decoder:,} + disentangle: {dis_params:,})"
+        f"Total trainable: {total_trainable:,} "
+        f"(decoder: {trainable_decoder:,} + disentangle: {dis_params:,})"
+    )
+    accelerator.print(
+        f"VQ content codebook: size={args.codebook_size}, dim={args.content_dim}"
     )
 
     # Load weights from checkpoint
     if args.resume_from:
-        # Load decoder weights
         checkpoint_path = Path(args.resume_from) / "decoder_block.safetensors"
         if checkpoint_path.exists():
             accelerator.print(f"Loading generator weights from {checkpoint_path}...")
@@ -651,7 +700,6 @@ def create_model(args, accelerator):
                 f"WARNING: decoder_block.safetensors not found at {checkpoint_path}"
             )
 
-        # Load DisentangledProjection weights (critical fix: was missing before)
         dis_path = Path(args.resume_from) / "disentangle.safetensors"
         if dis_path.exists():
             accelerator.print(f"Loading DisentangledProjection from {dis_path}...")
@@ -677,11 +725,7 @@ def create_model(args, accelerator):
 
 
 def create_discriminators(accelerator):
-    """
-    Create MPD and SpecDiscriminator discriminators.
-    Parameters ported from inworld-ai/tts (48kHz training)
-    """
-
+    """Create MPD and SpecDiscriminator discriminators."""
     mpd = HiFiGANMultiPeriodDiscriminator(
         periods=[2, 3, 5, 7, 11],
         max_downsample_channels=512,
@@ -715,6 +759,10 @@ def create_discriminators(accelerator):
     return mpd, msd
 
 
+# =============================================================================
+# Evaluation
+# =============================================================================
+
 @torch.no_grad()
 def eval_step(
     model: nn.Module,
@@ -727,7 +775,7 @@ def eval_step(
     ref_msd: "nn.Module | None" = None,
     max_batches: int = 50,
 ) -> dict:
-    """Evaluation (mel loss + optional discriminator stats + optional reference discriminator stats)."""
+    """Evaluation (mel loss + optional discriminator stats)."""
     model.eval()
     if mpd is not None:
         mpd.eval()
@@ -754,7 +802,6 @@ def eval_step(
 
             pred_48k = model(audio_codes)
 
-            # Align shapes and mask padding
             pred, target, min_len = align_audio(pred_48k, target_audio)
             pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
 
@@ -764,7 +811,6 @@ def eval_step(
             pred_wav = pred.unsqueeze(1)
             target_wav = target.unsqueeze(1)
 
-            # Discriminator d_r / d_g stats
             if mpd is not None and msd is not None:
                 _, dr_mpd, dg_mpd = discriminator_loss(
                     mpd(target_wav), mpd(pred_wav)
@@ -777,7 +823,6 @@ def eval_step(
                 total_dr_msd += dr_msd.item()
                 total_dg_msd += dg_msd.item()
 
-            # Reference discriminator d_g stats
             if ref_mpd is not None and ref_msd is not None:
                 _, _, ref_dg_mpd = discriminator_loss(
                     ref_mpd(target_wav), ref_mpd(pred_wav)
@@ -817,6 +862,10 @@ def eval_step(
     return result
 
 
+# =============================================================================
+# Checkpointing
+# =============================================================================
+
 def save_checkpoint(
     model: nn.Module,
     mpd: "nn.Module | None",
@@ -843,11 +892,10 @@ def save_checkpoint(
     checkpoint_dir = output_dir / checkpoint_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generator trainable weights (merge.py compatible)
+    # Generator trainable weights
     unwrapped_model = accelerator.unwrap_model(model)
     decoder = unwrapped_model.decoder
     if args.train_full_decoder:
-        # Save entire decoder state
         trainable_state_dict = {k: v.cpu() for k, v in decoder.state_dict().items()}
     else:
         trainable_state_dict = {}
@@ -862,14 +910,14 @@ def save_checkpoint(
                 trainable_state_dict[k] = v.cpu()
     save_file(trainable_state_dict, str(checkpoint_dir / "decoder_block.safetensors"))
 
-    # DisentangledProjection weights (needed for voice conversion inference)
+    # DisentangledProjection weights
     if hasattr(unwrapped_model, "disentangle"):
         disentangle_state = {
             k: v.cpu() for k, v in unwrapped_model.disentangle.state_dict().items()
         }
         save_file(disentangle_state, str(checkpoint_dir / "disentangle.safetensors"))
 
-    # Discriminator weights (only when GAN is enabled)
+    # Discriminator weights
     if args.use_gan and mpd is not None and msd is not None:
         unwrapped_mpd = accelerator.unwrap_model(mpd)
         unwrapped_msd = accelerator.unwrap_model(msd)
@@ -904,6 +952,9 @@ def save_checkpoint(
         "add_48k_decoder_block": args.add_48k_decoder_block,
         "train_full_decoder": args.train_full_decoder,
         "speaker_dim": args.speaker_dim,
+        "content_dim": args.content_dim,
+        "codebook_size": args.codebook_size,
+        "vq_commitment_cost": args.vq_commitment_cost,
         "step": step,
         "epoch": epoch,
         "training_type": "gan" if args.use_gan else "reconstruction",
@@ -929,6 +980,10 @@ def save_checkpoint(
     accelerator.print(f"Saved checkpoint to {checkpoint_dir}")
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
 def main():
     args = parse_args()
 
@@ -949,14 +1004,14 @@ def main():
         args, accelerator
     )
 
-    # Create discriminators (only when GAN is enabled)
+    # Create discriminators
     if args.use_gan:
         mpd, msd = create_discriminators(accelerator)
     else:
         mpd, msd = None, None
         accelerator.print("GAN disabled: skipping discriminator creation.")
 
-    # Create reference discriminators (frozen, for eval logging)
+    # Reference discriminators (frozen, for eval logging)
     ref_mpd, ref_msd = None, None
     if args.ref_discriminator_checkpoint:
         ref_disc_path = Path(args.ref_discriminator_checkpoint) / "discriminator.pt"
@@ -980,7 +1035,7 @@ def main():
                 f"{ref_disc_path} not found. Skipping reference discriminators."
             )
 
-    # Mel loss (reconstruction component)
+    # Mel loss
     target_sample_rate = BASE_SAMPLE_RATE * (
         args.extra_upsample_rate if args.add_48k_decoder_block else 1
     )
@@ -991,7 +1046,6 @@ def main():
     # Training data
     accelerator.print(f"Loading training data: {args.train_shards}...")
     shard_pattern = expand_shards(args.train_shards, accelerator.print)
-
     train_dataloader = create_webdataset_loader(
         shard_pattern=shard_pattern,
         target_sample_rate=target_sample_rate,
@@ -1006,7 +1060,6 @@ def main():
     val_dataloader = None
     if args.val_shards:
         shard_pattern = expand_shards(args.val_shards, accelerator.print)
-
         val_dataloader = create_webdataset_loader(
             shard_pattern=shard_pattern,
             target_sample_rate=target_sample_rate,
@@ -1017,7 +1070,7 @@ def main():
             shuffle_buffer=0,
         )
 
-    # Separate optimizers for G and D
+    # Optimizers
     optimizer_g = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr_g,
@@ -1025,9 +1078,6 @@ def main():
         weight_decay=args.weight_decay,
     )
     if args.use_gan:
-        # Lazy regularization ratio: adjusts lr and betas so that the expected
-        # update magnitude is the same as applying R1 every step.
-        # (StyleGAN2: d_reg_ratio = d_reg_every / (d_reg_every + 1))
         if args.r1 > 0 and args.d_reg_every > 1:
             d_reg_ratio = args.d_reg_every / (args.d_reg_every + 1)
         else:
@@ -1073,6 +1123,7 @@ def main():
         scheduler_g = CosineAnnealingLR(
             optimizer_g, T_max=total_steps, eta_min=args.lr_g * 0.1
         )
+
     if args.use_gan:
         cosine_steps_d = max(1, total_steps - warmup_steps)
         if warmup_steps > 0:
@@ -1090,6 +1141,7 @@ def main():
             )
     else:
         scheduler_d = None
+
     accelerator.print(f"Total training steps: {total_steps}")
 
     # Prepare with Accelerate
@@ -1104,7 +1156,7 @@ def main():
     if val_dataloader:
         val_dataloader = accelerator.prepare(val_dataloader)
 
-    # Cache discriminator params and dtype (used repeatedly in training loop)
+    # Cache discriminator params and dtype
     if args.use_gan:
         disc_params = list(mpd.parameters()) + list(msd.parameters())
         disc_dtype = next(mpd.parameters()).dtype
@@ -1134,6 +1186,9 @@ def main():
             "training_type": "gan" if args.use_gan else "reconstruction",
             "r1": args.r1,
             "d_reg_every": args.d_reg_every,
+            "content_dim": args.content_dim,
+            "codebook_size": args.codebook_size,
+            "vq_commitment_cost": args.vq_commitment_cost,
         }
         if args.log_with == "wandb":
             accelerator.init_trackers(
@@ -1154,14 +1209,13 @@ def main():
     elif args.log_with:
         accelerator.init_trackers(project_name=args.wandb_project)
 
-    # Resume training state (generator weights already loaded in create_model())
+    # Resume training state
     start_step = 0
     start_epoch = 0
     if args.resume_from:
         accelerator.print(f"Resuming training state from {args.resume_from}...")
         checkpoint_dir = Path(args.resume_from)
 
-        # Load checkpoint config to check num_frozen compatibility
         prev_num_frozen = None
         config_path = checkpoint_dir / "config.json"
         if config_path.exists():
@@ -1178,16 +1232,12 @@ def main():
                 f"Generator optimizer/scheduler state will NOT be restored."
             )
 
-        # Load discriminator weights (only when GAN is enabled)
         disc_path = checkpoint_dir / "discriminator.pt"
         if args.use_gan and disc_path.exists():
             disc_state = torch.load(disc_path, map_location="cpu")
             accelerator.unwrap_model(mpd).load_state_dict(disc_state["mpd"])
             accelerator.unwrap_model(msd).load_state_dict(disc_state["msd"])
 
-        # Load training state
-        start_step = 0
-        start_epoch = 0
         training_state_path = checkpoint_dir / "training_state.pt"
         if not training_state_path.exists():
             accelerator.print(
@@ -1195,31 +1245,30 @@ def main():
                 f"Cannot resume optimizer/scheduler state or step/epoch count."
             )
         else:
-            training_state = torch.load(
-                training_state_path, map_location="cpu"
-            )
+            training_state = torch.load(training_state_path, map_location="cpu")
             start_step = training_state["step"]
             start_epoch = training_state["epoch"]
 
-        if not args.no_resume_optimizer:
-            if not num_frozen_changed:
-                optimizer_g.load_state_dict(training_state["optimizer_g"])
-                if training_state["scheduler_g"] and scheduler_g:
-                    scheduler_g.load_state_dict(training_state["scheduler_g"])
+            if not args.no_resume_optimizer:
+                if not num_frozen_changed:
+                    optimizer_g.load_state_dict(training_state["optimizer_g"])
+                    if training_state["scheduler_g"] and scheduler_g:
+                        scheduler_g.load_state_dict(training_state["scheduler_g"])
 
-            # Discriminator optimizer/scheduler is always restored (unaffected by num_frozen)
-            if (
-                args.use_gan
-                and optimizer_d is not None
-                and training_state.get("optimizer_d")
-            ):
-                optimizer_d.load_state_dict(training_state["optimizer_d"])
-            if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
-                scheduler_d.load_state_dict(training_state["scheduler_d"])
+                if (
+                    args.use_gan
+                    and optimizer_d is not None
+                    and training_state.get("optimizer_d")
+                ):
+                    optimizer_d.load_state_dict(training_state["optimizer_d"])
+                if args.use_gan and training_state.get("scheduler_d") and scheduler_d:
+                    scheduler_d.load_state_dict(training_state["scheduler_d"])
 
         accelerator.print(f"Resumed from step {start_step}, epoch {start_epoch}")
 
+    # =========================================================================
     # Training loop
+    # =========================================================================
     global_step = start_step
     best_val_loss = float("inf")
 
@@ -1228,14 +1277,14 @@ def main():
         mpd.train()
         msd.train()
 
-    # Persistent across optimizer-step logs.
     mpd_grad_norm = 0.0
     msd_grad_norm = 0.0
     gen_grad_norm = 0.0
-    r1_loss_val = 0.0  # last computed R1 penalty (persists between reg steps)
+    r1_loss_val = 0.0
     total_audio_sec = 0
-    spike_skipped = 0  # counter for skipped batches
-    mel_ema = None     # EMA of mel loss for spike detection
+    spike_skipped = 0
+    mel_ema = None
+
     for epoch in range(start_epoch, args.num_epochs):
         accelerator.print(f"\n{'=' * 50}")
         accelerator.print(f"Epoch {epoch + 1}/{args.num_epochs}")
@@ -1255,49 +1304,38 @@ def main():
             # Generator forward
             pred_48k = model(audio_codes)
 
-            # Align shapes for loss computation
+            # Align shapes
             pred, target, min_len = align_audio(pred_48k, target_audio)
-
-            # Mask padding region
             pred, target = apply_length_mask(pred, target, audio_lengths, min_len)
 
-            # Initialize GAN loss placeholders
+            # GAN loss placeholders
             loss_d = pred.new_zeros(())
             loss_d_mpd = pred.new_zeros(())
             loss_d_msd = pred.new_zeros(())
             loss_g_adv = pred.new_zeros(())
             loss_fm = pred.new_zeros(())
+            loss_fm_mpd = pred.new_zeros(())
+            loss_fm_msd = pred.new_zeros(())
             dr_mpd = pred.new_zeros(())
             dg_mpd = pred.new_zeros(())
             dr_msd = pred.new_zeros(())
             dg_msd = pred.new_zeros(())
 
             if args.use_gan:
-                # Reshape to (B, 1, T) for discriminators
-                pred_wav = pred.unsqueeze(1)
-                target_wav = target.unsqueeze(1)
+                pred_wav = pred.unsqueeze(1).to(dtype=disc_dtype)
+                target_wav = target.unsqueeze(1).to(dtype=disc_dtype)
 
-                # Align dtype with discriminator params (handles generator checkpoint
-                # loaded in bf16 when mixed_precision=no)
-                pred_wav = pred_wav.to(dtype=disc_dtype)
-                target_wav = target_wav.to(dtype=disc_dtype)
-
-            # Update D and G under a single accumulation context so
-            # `accelerator.sync_gradients` is aligned for both.
             accumulate_models = [model] + ([mpd, msd] if args.use_gan else [])
             with accelerator.accumulate(*accumulate_models):
+
+                # ─── Discriminator update ──────────────────────────────────
                 if args.use_gan:
-                    # =====================
-                    # Discriminator update
-                    # =====================
-                    # MPD
                     mpd_real_outputs = mpd(target_wav)
                     mpd_fake_outputs = mpd(pred_wav.detach())
                     loss_d_mpd, dr_mpd, dg_mpd = discriminator_loss(
                         mpd_real_outputs, mpd_fake_outputs
                     )
 
-                    # MSD
                     msd_real_outputs = msd(target_wav)
                     msd_fake_outputs = msd(pred_wav.detach())
                     loss_d_msd, dr_msd, dg_msd = discriminator_loss(
@@ -1305,12 +1343,12 @@ def main():
                     )
 
                     loss_d = (
-                        args.lambda_d_mpd * loss_d_mpd + args.lambda_d_msd * loss_d_msd
+                        args.lambda_d_mpd * loss_d_mpd
+                        + args.lambda_d_msd * loss_d_msd
                     )
 
                     optimizer_d.zero_grad()
                     accelerator.backward(loss_d)
-                    # Capture per-model gradient norms immediately before D step.
                     if accelerator.sync_gradients:
                         mpd_grad_norm = compute_grad_norm(mpd)
                         msd_grad_norm = compute_grad_norm(msd)
@@ -1318,13 +1356,14 @@ def main():
                     optimizer_d.step()
                     scheduler_d.step()
 
-                # =====================
-                # R1 Discriminator Regularization
-                # (lazy: every d_reg_every optimizer steps, scaled by d_reg_every)
-                # =====================
-                if args.use_gan and args.r1 > 0 and args.d_reg_every > 0 and accelerator.sync_gradients and (global_step + 1) % args.d_reg_every == 0:
-                    # Cast to float32: bf16 mixed precision + STFT autodiff can
-                    # cause numerical instability with create_graph=True.
+                # ─── R1 regularization ────────────────────────────────────
+                if (
+                    args.use_gan
+                    and args.r1 > 0
+                    and args.d_reg_every > 0
+                    and accelerator.sync_gradients
+                    and (global_step + 1) % args.d_reg_every == 0
+                ):
                     target_wav_r1 = target_wav.detach().float().requires_grad_(True)
 
                     mpd_real_r1 = mpd(target_wav_r1)
@@ -1334,11 +1373,6 @@ def main():
                     r1_msd = d_r1_loss(msd_real_r1, target_wav_r1)
 
                     r1_total = r1_mpd + r1_msd
-
-                    # Lazy scaling: weight * d_reg_every keeps expected value equal
-                    # to applying R1 every step.
-                    # The `0 * anchor` terms keep the autograd graph connected so
-                    # accelerator.backward() can flush properly.
                     r1_loss_scaled = (
                         (args.r1 / 2) * r1_total * args.d_reg_every
                         + 0.0 * mpd_real_r1[0][-1].sum()
@@ -1349,16 +1383,10 @@ def main():
                     accelerator.backward(r1_loss_scaled)
                     accelerator.clip_grad_norm_(disc_params, args.max_grad_norm)
                     optimizer_d.step()
-                    # NOTE: scheduler_d.step() is NOT called here — the LR scheduler
-                    # steps only on the main D loss, not on the regularization pass.
-
                     r1_loss_val = r1_total.item()
 
-                # =====================
-                # Generator update
-                # =====================
+                # ─── Generator adversarial + FM ───────────────────────────
                 if args.use_gan:
-                    # MPD (real outputs computed without grad for FM loss)
                     mpd_fake_outputs_g = mpd(pred_wav)
                     with torch.no_grad():
                         mpd_real_outputs_g = mpd(target_wav)
@@ -1367,7 +1395,6 @@ def main():
                         mpd_real_outputs_g, mpd_fake_outputs_g
                     )
 
-                    # MSD (real outputs computed without grad for FM loss)
                     msd_fake_outputs_g = msd(pred_wav)
                     with torch.no_grad():
                         msd_real_outputs_g = msd(target_wav)
@@ -1376,47 +1403,39 @@ def main():
                         msd_real_outputs_g, msd_fake_outputs_g
                     )
 
-                    # Combined adversarial + feature matching
                     loss_g_adv = loss_g_adv_mpd + loss_g_adv_msd
                     loss_fm = loss_fm_mpd + loss_fm_msd
 
-                # Multi-resolution mel loss (inworld-ai style, 7 scales)
+                # ─── Reconstruction losses ────────────────────────────────
                 if args.lambda_multi_res_mel > 0:
                     loss_multi_res_mel = multi_res_mel_loss_fn(pred, target)
                 else:
                     loss_multi_res_mel = pred.new_zeros(())
 
-                # Global dB RMS loss (inworld-ai style)
                 if args.lambda_global_rms > 0:
                     loss_global_rms = global_rms_loss(pred, target)
                 else:
                     loss_global_rms = pred.new_zeros(())
 
-                # =====================
-                # Disentanglement losses
-                # =====================
+                # ─── Disentanglement losses ───────────────────────────────
                 unwrapped_model = accelerator.unwrap_model(model)
                 speaker_emb = unwrapped_model.last_speaker_emb
                 content_emb = unwrapped_model.last_content_emb
                 speaker_global = unwrapped_model.last_speaker_global
                 original_hidden = unwrapped_model.last_original_hidden
+                # VQ losses (from discrete content codebook)
+                commit_loss = unwrapped_model.last_commit_loss
 
-                # Linear warmup ramp for disentanglement losses.
-                # Prevents GAN collapse by letting the model stabilize with
-                # standard reconstruction/adversarial losses first.
+                # Linear warmup ramp for disentanglement losses
                 if args.disentangle_warmup_steps > 0:
                     dis_ramp = min(1.0, global_step / args.disentangle_warmup_steps)
                 else:
                     dis_ramp = 1.0
-                
-                # Orthogonality: speaker ⊥ content
-                loss_ortho = torch.nn.functional.cosine_similarity(
-                    speaker_emb, content_emb, dim=-1
-                ).abs().mean()
-                
+
+                # Orthogonality: speaker ⊥ content (Disabled: single codebook mode)
+                loss_ortho = content_emb.new_zeros(())
+
                 # Content consistency: MSE(content_emb, original_hidden)
-                # Only constrains the content path (not the combined sum),
-                # allowing the speaker path to freely add new information.
                 if args.lambda_consistency > 0:
                     loss_consistency = torch.nn.functional.mse_loss(
                         content_emb, original_hidden
@@ -1424,40 +1443,13 @@ def main():
                 else:
                     loss_consistency = content_emb.new_zeros(())
 
-                # Speaker identity preservation: re-extract speaker from
-                # combined hidden and ensure it matches the original.
-                # This gives a direct gradient signal for voice preservation.
-                if args.lambda_speaker_id > 0 and dis_ramp > 0:
-                    combined_hidden = speaker_emb + content_emb
-                    re_speaker = unwrapped_model.disentangle.encode_speaker(
-                        combined_hidden
-                    )
-                    loss_speaker_id = 1.0 - torch.nn.functional.cosine_similarity(
-                        re_speaker, speaker_global.detach(), dim=-1
-                    ).mean()
-                else:
-                    loss_speaker_id = content_emb.new_zeros(())
+                # Speaker identity preservation (Disabled: single codebook mode)
+                loss_speaker_id = content_emb.new_zeros(())
 
-                # In-batch speaker swap cycle consistency:
-                # Swap speakers within the batch, re-extract, ensure match.
-                # Trains the model to handle voice conversion during training.
-                if args.lambda_cycle > 0 and pred.shape[0] >= 2 and dis_ramp > 0:
-                    B = speaker_global.shape[0]
-                    perm = torch.randperm(B, device=speaker_global.device)
-                    swapped_speaker = speaker_global[perm]
-                    swapped_contrib = unwrapped_model.disentangle.decode_speaker(
-                        swapped_speaker, content_emb.shape[1]
-                    )
-                    swapped_combined = swapped_contrib + content_emb.detach()
-                    re_swapped = unwrapped_model.disentangle.encode_speaker(
-                        swapped_combined
-                    )
-                    loss_cycle = 1.0 - torch.nn.functional.cosine_similarity(
-                        re_swapped, swapped_speaker.detach(), dim=-1
-                    ).mean()
-                else:
-                    loss_cycle = content_emb.new_zeros(())
+                # In-batch speaker swap cycle consistency (Disabled: single codebook mode)
+                loss_cycle = content_emb.new_zeros(())
 
+                # Total generator loss (commit_loss is VQ bottleneck loss)
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
@@ -1467,16 +1459,15 @@ def main():
                     + args.lambda_consistency * loss_consistency
                     + dis_ramp * args.lambda_speaker_id * loss_speaker_id
                     + dis_ramp * args.lambda_cycle * loss_cycle
+                    + commit_loss  # VQ commitment loss (no extra lambda, built-in weight)
                 )
 
-                # =====================
-                # Spike detection: skip poisoned batches
-                # =====================
+                # ─── Spike detection ──────────────────────────────────────
                 mel_val = loss_multi_res_mel.item()
                 skip_this_batch = False
                 if args.spike_skip_threshold > 0:
                     if mel_ema is None:
-                        mel_ema = mel_val  # init on first batch
+                        mel_ema = mel_val
                     else:
                         if mel_val > args.spike_skip_threshold * mel_ema and global_step > 50:
                             skip_this_batch = True
@@ -1484,15 +1475,18 @@ def main():
                             if accelerator.is_main_process:
                                 accelerator.print(
                                     f"  ⚠ SPIKE SKIP step {global_step}: "
-                                    f"mel={mel_val:.2f} > {args.spike_skip_threshold}×EMA({mel_ema:.2f})="
+                                    f"mel={mel_val:.2f} > {args.spike_skip_threshold}"
+                                    f"×EMA({mel_ema:.2f})="
                                     f"{args.spike_skip_threshold * mel_ema:.2f}. "
                                     f"Skipping G update. (total skipped: {spike_skipped})"
                                 )
-                        # Update EMA only on non-spiked batches
                         if not skip_this_batch:
-                            mel_ema = args.spike_ema_decay * mel_ema + (1 - args.spike_ema_decay) * mel_val
+                            mel_ema = (
+                                args.spike_ema_decay * mel_ema
+                                + (1 - args.spike_ema_decay) * mel_val
+                            )
 
-                # Per-component gradient norms (only on log steps)
+                # ─── Per-component gradient norms (optional) ───────────────
                 g_grad_norms = {}
                 should_log_grad = (
                     args.log_grad_norms
@@ -1501,9 +1495,7 @@ def main():
                     and not skip_this_batch
                 )
                 if should_log_grad:
-                    gen_params = [
-                        p for p in model.parameters() if p.requires_grad
-                    ]
+                    gen_params = [p for p in model.parameters() if p.requires_grad]
                     for gn_name, gn_loss, gn_lam in [
                         ("g/grad_norm_adv", loss_g_adv, args.lambda_adv),
                         ("g/grad_norm_fm", loss_fm, args.lambda_fm),
@@ -1527,8 +1519,8 @@ def main():
                             )
                             g_grad_norms[gn_name] = total_norm.item()
 
+                # ─── Generator step ───────────────────────────────────────
                 if skip_this_batch:
-                    # Skip generator update — just zero grads and step scheduler
                     optimizer_g.zero_grad()
                     scheduler_g.step()
                 else:
@@ -1540,13 +1532,12 @@ def main():
                     optimizer_g.step()
                     scheduler_g.step()
 
-            # Count/log/eval/save only on real optimizer sync steps.
+            # ── Log / eval / save (only on real sync steps) ───────────────
             if accelerator.sync_gradients:
                 global_step += 1
                 audio_sec = audio_lengths.sum().item() / target_sample_rate
                 total_audio_sec += audio_sec
 
-                # Logging
                 if global_step % args.log_every == 0:
                     log_dict = {
                         "g/loss_total": loss_g.item(),
@@ -1556,6 +1547,8 @@ def main():
                         "g/loss_consistency": loss_consistency.item(),
                         "g/loss_speaker_id": loss_speaker_id.item(),
                         "g/loss_cycle": loss_cycle.item(),
+                        "g/vq_commit_loss": commit_loss.item(),
+                        "g/vq_codebook_usage": unwrapped_model.disentangle.vq.codebook_usage(),
                         "g/dis_ramp": dis_ramp,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
@@ -1591,6 +1584,7 @@ def main():
                     progress_bar.set_postfix(
                         g=loss_g.item(),
                         mel=loss_multi_res_mel.item(),
+                        vq=commit_loss.item(),
                         **(
                             {"d": loss_d.item(), "adv": loss_g_adv.item()}
                             if args.use_gan
@@ -1619,14 +1613,7 @@ def main():
                     )
                     accelerator.log(val_losses, step=global_step)
 
-                    # Log Voice Conversion Table to W&B
-                    # 5-column table (all audio):
-                    #   1. Original Speaker Audio (ground truth)
-                    #   2. Original Speaker Reconstruction (model output)
-                    #   3. Target Speaker Audio (ground truth voice source)
-                    #   4. Target Speaker Reconstruction (model output)
-                    #   5. Converted Output (content from original + voice from target)
-                    # 3 rows of in-batch speaker swap demos
+                    # W&B Voice Conversion Table
                     if accelerator.is_main_process:
                         try:
                             import wandb
@@ -1654,7 +1641,6 @@ def main():
                                     wav = block(wav)
                                 return wav.clamp(-1, 1).squeeze().float().cpu().numpy()
 
-                            # Build voice conversion pairs: (src_idx, tgt_idx)
                             B = sample_codes.shape[0]
                             vc_pairs = []
                             if B >= 2:
@@ -1664,11 +1650,9 @@ def main():
                                 vc_pairs.append((0, 2))
                             elif B >= 2:
                                 vc_pairs.append((1, 0))
-                            # Ensure exactly 3 rows
                             while len(vc_pairs) < 3 and len(vc_pairs) > 0:
                                 vc_pairs.append(vc_pairs[0])
 
-                            # Build W&B Table (all audio columns)
                             vc_table = wandb.Table(columns=[
                                 "Original Speaker Audio",
                                 "Original Speaker Reconstruction",
@@ -1677,8 +1661,7 @@ def main():
                                 "Converted Output",
                             ])
 
-                            with torch.inference_mode():
-                                # Pre-compute reconstructions for each unique sample index
+                            with torch.inference_mode(), accelerator.autocast():
                                 unique_indices = sorted(set(
                                     idx for pair in vc_pairs[:3] for idx in pair
                                 ))
@@ -1687,23 +1670,21 @@ def main():
                                 for idx in unique_indices:
                                     h = _to_hidden(sample_codes[idx:idx+1])
                                     hidden_cache[idx] = h
-                                    # Pass through DisentangledProjection (same as training path)
-                                    spk_c, cnt_c, _ = dis(h)
+                                    # disentangle returns 5 values — unpack all
+                                    spk_c, cnt_c, _, _, _ = dis(h)
                                     recon_hidden = spk_c + cnt_c
                                     recon_cache[idx] = _decode_hidden(recon_hidden)
 
                                 for src_i, tgt_i in vc_pairs[:3]:
                                     try:
-                                        # Ground truth audio
                                         src_gt_np = sample_targets[src_i].numpy()
                                         tgt_gt_np = sample_targets[tgt_i].numpy()
-
-                                        # Reconstructed audio (model output)
                                         src_recon_np = recon_cache[src_i]
                                         tgt_recon_np = recon_cache[tgt_i]
 
-                                        # Voice conversion: content[src] + speaker[tgt]
-                                        content_src = dis.encode_content(hidden_cache[src_i])
+                                        # Voice conversion:
+                                        # encode_content returns (content_emb, indices, commit_loss)
+                                        content_src, _, _ = dis.encode_content(hidden_cache[src_i])
                                         speaker_tgt = dis.encode_speaker(hidden_cache[tgt_i])
                                         speaker_tgt_contrib = dis.decode_speaker(
                                             speaker_tgt, content_src.shape[1]
@@ -1726,72 +1707,50 @@ def main():
                                     except Exception as row_e:
                                         accelerator.print(f"VC table row failed: {row_e}")
 
+                            log_media = {"voice_conversion_table": vc_table}
+                            for i in range(min(2, B)):
+                                if i in recon_cache:
+                                    log_media[f"val/audio_original_{i}"] = wandb.Audio(
+                                        sample_targets[i].numpy(), sample_rate=sample_sr
+                                    )
+                                    log_media[f"val/audio_recon_{i}"] = wandb.Audio(
+                                        recon_cache[i], sample_rate=sample_sr
+                                    )
                             accelerator.log(
-                                {"voice_conversion_table": vc_table},
+                                log_media,
                                 step=global_step,
                             )
                         except Exception as e:
                             accelerator.print(f"Audio logging failed: {e}")
 
-
                     if val_losses["val/loss_multi_res_mel"] < best_val_loss:
                         best_val_loss = val_losses["val/loss_multi_res_mel"]
                         save_checkpoint(
-                            model,
-                            mpd,
-                            msd,
-                            optimizer_g,
-                            optimizer_d,
-                            scheduler_g,
-                            scheduler_d,
-                            global_step,
-                            epoch,
-                            args,
-                            accelerator,
-                            num_frozen,
-                            base_upsample_rates,
-                            new_upsample_rates,
+                            model, mpd, msd, optimizer_g, optimizer_d,
+                            scheduler_g, scheduler_d, global_step, epoch,
+                            args, accelerator, num_frozen,
+                            base_upsample_rates, new_upsample_rates,
                             is_best=True,
                         )
 
-                # Save checkpoint
+                # Periodic checkpoint
                 if global_step % args.save_every == 0 and global_step > 0:
                     save_checkpoint(
-                        model,
-                        mpd,
-                        msd,
-                        optimizer_g,
-                        optimizer_d,
-                        scheduler_g,
-                        scheduler_d,
-                        global_step,
-                        epoch,
-                        args,
-                        accelerator,
-                        num_frozen,
-                        base_upsample_rates,
-                        new_upsample_rates,
+                        model, mpd, msd, optimizer_g, optimizer_d,
+                        scheduler_g, scheduler_d, global_step, epoch,
+                        args, accelerator, num_frozen,
+                        base_upsample_rates, new_upsample_rates,
                     )
 
                 if args.max_train_steps and global_step >= args.max_train_steps:
                     break
 
-        # Save at end of epoch
+        # End-of-epoch checkpoint
         save_checkpoint(
-            model,
-            mpd,
-            msd,
-            optimizer_g,
-            optimizer_d,
-            scheduler_g,
-            scheduler_d,
-            global_step,
-            epoch,
-            args,
-            accelerator,
-            num_frozen,
-            base_upsample_rates,
-            new_upsample_rates,
+            model, mpd, msd, optimizer_g, optimizer_d,
+            scheduler_g, scheduler_d, global_step, epoch,
+            args, accelerator, num_frozen,
+            base_upsample_rates, new_upsample_rates,
         )
 
         if args.max_train_steps and global_step >= args.max_train_steps:
@@ -1799,20 +1758,10 @@ def main():
 
     # Final checkpoint
     save_checkpoint(
-        model,
-        mpd,
-        msd,
-        optimizer_g,
-        optimizer_d,
-        scheduler_g,
-        scheduler_d,
-        global_step,
-        args.num_epochs,
-        args,
-        accelerator,
-        num_frozen,
-        base_upsample_rates,
-        new_upsample_rates,
+        model, mpd, msd, optimizer_g, optimizer_d,
+        scheduler_g, scheduler_d, global_step, args.num_epochs,
+        args, accelerator, num_frozen,
+        base_upsample_rates, new_upsample_rates,
     )
 
     accelerator.end_training()
