@@ -8,35 +8,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=99
+RUN_NUMBER=101
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# EXPERIMENT 99: SINGLE CODEBOOK VQ
+# EXPERIMENT 101: REVERT TO EXPERIMENT 81 (DISENTANGLED VQ)
 #
-# Follows the PROVEN pattern from Exp 81's content VQ:
-#   1. Near-identity pre-projection (1024 → 1024) — NOT 256-dim!
-#   2. VQ in same 1024-dim — codebook inits from meaningful hidden states
-#   3. Single alpha blend (NO double-alpha that killed v1)
-#   4. Direct VQ output to decoder (NO near-zero post_vq)
-#
-# Fixes from failed v1:
-#   - v1 bug: double alpha (α²) → VQ got no gradients → codebook collapsed
-#   - v1 bug: near-zero post_vq init → decoder got zeros → empty audio
-#   - v1 bug: 256-dim projection → random init destroyed hidden structure
-#
-# 8192 codes × 1024-dim, same architecture as exp 81 content path.
+# User requested returning EXACTLY to Experiment 81, which produced excellent
+# reconstruction. This uses the 2-codebook DisentangledVQ (content + speaker)
+# with the speaker broadcast providing the global context needed for high fidelity.
 # ──────────────────────────────────────────────────────────────────────────────
 
 uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --train_shards "${TRAIN_SHARDS}" \
     --val_shards   "${VAL_SHARDS}"   \
     --output_dir   "${OUTPUT_DIR}/run${RUN_NUMBER}" \
-    \
-    --single_codebook \
-    --train_full_decoder \
-    --codebook_size 8192 \
-    --vq_dim 256 \
-    --entropy_weight 0.1 \
     \
     --batch_size 4 \
     --gradient_accumulation_steps 2 \
@@ -65,10 +50,10 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     --lambda_d_mpd         0.01 \
     --lambda_d_msd         0.1  \
     --lambda_vq            1.0  \
-    --lambda_orth          0.0  \
+    --lambda_orth          0.5  \
     --lambda_consistency   0.0  \
-    --lambda_speaker_id    0.0  \
-    --lambda_cycle         0.0  \
+    --lambda_speaker_id    1.0  \
+    --lambda_cycle         0.5  \
     --lambda_speaker_adv   0.0  \
     --lambda_speaker_div   0.0  \
     --content_dropout      0.0  \
@@ -81,4 +66,4 @@ uv run accelerate launch "${SCRIPT_DIR}/src/trainer.py" \
     \
     --mixed_precision bf16 \
     --wandb_project  Qwen3-TTS-Tokenizer-12Hz-Trainer \
-    --wandb_run_name "Run${RUN_NUMBER}-SingleCodebook-8192-FIXED"
+    --wandb_run_name "Run${RUN_NUMBER}-Revert-To-Exp81"
