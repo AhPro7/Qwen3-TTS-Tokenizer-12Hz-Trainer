@@ -8,10 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRAIN_SHARDS="${SCRIPT_DIR}/datasets3/train/*.tar"
 VAL_SHARDS="${SCRIPT_DIR}/datasets3/val/*.tar"
 OUTPUT_DIR="/content/drive/MyDrive/qwen-tokenzier-v2"
-RUN_NUMBER=96
+RUN_NUMBER=97
 
 # ── Rationale ─────────────────────────────────────────────────────────────────
-# EXPERIMENT 96: SINGLE CODEBOOK VQ
+# EXPERIMENT 97: SINGLE CODEBOOK VQ
 #
 # Follows the PROVEN pattern from Exp 81's content VQ:
 #   1. Near-identity pre-projection (1024 → 1024) — NOT 256-dim!

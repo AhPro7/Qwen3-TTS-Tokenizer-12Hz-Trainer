@@ -33,14 +33,12 @@ class VectorQuantizeEnhanced(nn.Module):
     enhanced with dead code reset and usage metrics.
     """
 
-    def __init__(self, dim, codebook_size, decay=0.99, eps=1e-5,
-                 threshold_dead_frames=2):
+    def __init__(self, dim, codebook_size, decay=0.99, eps=1e-5):
         super().__init__()
         self.dim = dim
         self.codebook_size = codebook_size
         self.decay = decay
         self.eps = eps
-        self.threshold_dead_frames = threshold_dead_frames
 
         self.embedding = nn.Embedding(codebook_size, dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / codebook_size,
@@ -52,54 +50,35 @@ class VectorQuantizeEnhanced(nn.Module):
                              self.embedding.weight.data.clone())
         self.register_buffer("initted", torch.tensor(False))
 
-        # Dead code tracking
-        self.register_buffer("frames_since_used",
-                             torch.zeros(codebook_size, dtype=torch.long))
-
     def _init_from_data(self, x_flat):
-        """Initialize codebook from first batch of data (k-means++ style)."""
+        """Initialize codebook from first batch of data (k-means++ style).
+        If batch is smaller than codebook, tile the batch with noise to fill it.
+        """
         if self.initted.item():
             return
-        n = min(x_flat.shape[0], self.codebook_size)
-        indices = torch.randperm(x_flat.shape[0], device=x_flat.device)[:n]
-        data = x_flat[indices].detach().float()
-        self.embedding.weight.data[:n] = data.to(self.embedding.weight.dtype)
-        self.ema_embed_sum.data[:n] = data.to(self.ema_embed_sum.dtype)
-        self.ema_cluster_size.data[:n] = 1.0
+            
+        data = x_flat.detach().float()
+        n_data = data.shape[0]
+        
+        if n_data >= self.codebook_size:
+            # Batch is large enough, just pick random subset
+            indices = torch.randperm(n_data, device=x_flat.device)[:self.codebook_size]
+            init_data = data[indices]
+        else:
+            # Batch is too small, tile it with noise
+            repeats = (self.codebook_size // n_data) + 1
+            tiled_data = data.repeat(repeats, 1)
+            # Add small noise to break symmetry
+            noise = torch.randn_like(tiled_data) * 0.01 * data.std(dim=0, keepdim=True)
+            tiled_data = tiled_data + noise
+            # Take exactly codebook_size elements
+            indices = torch.randperm(tiled_data.shape[0], device=x_flat.device)[:self.codebook_size]
+            init_data = tiled_data[indices]
+            
+        self.embedding.weight.data.copy_(init_data.to(self.embedding.weight.dtype))
+        self.ema_embed_sum.data.copy_(init_data.to(self.ema_embed_sum.dtype))
+        self.ema_cluster_size.data.fill_(1.0)
         self.initted.fill_(True)
-
-    def _reset_dead_codes(self, x_flat):
-        """Reset codes unused for threshold_dead_frames steps."""
-        dead_mask = self.frames_since_used >= self.threshold_dead_frames
-        num_dead = dead_mask.sum().item()
-        if num_dead == 0:
-            return 0
-
-        n_replace = min(num_dead, x_flat.shape[0])
-        if n_replace == 0:
-            return 0
-
-        # Replace dead codes with random batch vectors + small noise
-        replace_indices = torch.randperm(
-            x_flat.shape[0], device=x_flat.device
-        )[:n_replace]
-        dead_indices = dead_mask.nonzero(as_tuple=True)[0][:n_replace]
-
-        replacement = x_flat[replace_indices].detach()
-        # Add small noise to avoid exact duplicates
-        noise = torch.randn_like(replacement) * 0.01
-        replacement = replacement + noise
-
-        self.embedding.weight.data[dead_indices] = replacement.to(
-            self.embedding.weight.dtype
-        )
-        self.ema_embed_sum.data[dead_indices] = replacement.to(
-            self.ema_embed_sum.dtype
-        )
-        self.ema_cluster_size.data[dead_indices] = 1.0
-        self.frames_since_used[dead_indices] = 0
-
-        return n_replace
 
     def forward(self, x):
         """x: [..., D] → quantized [..., D], indices [...], vq_loss, metrics"""
@@ -149,12 +128,6 @@ class VectorQuantizeEnhanced(nn.Module):
                 new_weights.to(self.embedding.weight.dtype)
             )
 
-            # Dead code tracking + reset
-            used_mask = cluster_size > 0
-            self.frames_since_used[used_mask] = 0
-            self.frames_since_used[~used_mask] += 1
-            self._reset_dead_codes(x_flat)
-
         # Losses
         commitment_loss = F.mse_loss(x_flat, quantized.detach().float())
         codebook_loss = F.mse_loss(quantized.float(), x_flat.detach())
@@ -167,10 +140,6 @@ class VectorQuantizeEnhanced(nn.Module):
             "codebook_usage": usage_frac,
             "unique_codes": unique_codes,
             "perplexity": perplexity.item(),
-            "dead_codes": (
-                (self.frames_since_used >= self.threshold_dead_frames)
-                .sum().item()
-            ),
         }
 
         return (
