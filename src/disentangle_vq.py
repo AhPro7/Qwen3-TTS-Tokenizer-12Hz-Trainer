@@ -37,8 +37,9 @@ class VectorQuantize(nn.Module):
             return
         n = min(x_flat.shape[0], self.codebook_size)
         indices = torch.randperm(x_flat.shape[0], device=x_flat.device)[:n]
-        self.embedding.weight.data[:n] = x_flat[indices].detach()
-        self.ema_embed_sum.data[:n] = x_flat[indices].detach()
+        data = x_flat[indices].detach().float()
+        self.embedding.weight.data[:n] = data.to(self.embedding.weight.dtype)
+        self.ema_embed_sum.data[:n] = data.to(self.ema_embed_sum.dtype)
         self.ema_cluster_size.data[:n] = 1.0
         self.initted.fill_(True)
 
@@ -51,25 +52,31 @@ class VectorQuantize(nn.Module):
         if self.training:
             self._init_from_data(x_flat)
 
-        # Distances
+        # Distances (always in float32 for numerical stability)
         dist = torch.cdist(x_flat, self.embedding.weight.float())
         indices = dist.argmin(dim=-1)
         quantized = self.embedding(indices).to(x.dtype)
 
-        # EMA codebook update (training only)
+        # EMA codebook update (all in float32, then cast back)
         if self.training:
             one_hot = F.one_hot(indices, self.codebook_size).float()
             cluster_size = one_hot.sum(0)
             embed_sum = one_hot.t() @ x_flat
 
-            self.ema_cluster_size.lerp_(cluster_size, 1 - self.decay)
-            self.ema_embed_sum.lerp_(embed_sum, 1 - self.decay)
+            # Do EMA in float32 to avoid bf16 lerp_ mismatch
+            ema_cs = self.ema_cluster_size.float()
+            ema_es = self.ema_embed_sum.float()
+            ema_cs.lerp_(cluster_size, 1 - self.decay)
+            ema_es.lerp_(embed_sum, 1 - self.decay)
+            self.ema_cluster_size.copy_(ema_cs)
+            self.ema_embed_sum.copy_(ema_es)
 
-            n = self.ema_cluster_size.sum()
+            n = ema_cs.sum()
             cluster_size_smoothed = (
-                (self.ema_cluster_size + self.eps) / (n + self.codebook_size * self.eps) * n
+                (ema_cs + self.eps) / (n + self.codebook_size * self.eps) * n
             )
-            self.embedding.weight.data = self.ema_embed_sum / cluster_size_smoothed.unsqueeze(1)
+            new_weights = ema_es / cluster_size_smoothed.unsqueeze(1)
+            self.embedding.weight.data.copy_(new_weights.to(self.embedding.weight.dtype))
 
         # Losses
         commitment_loss = F.mse_loss(x_flat, quantized.detach().float())
