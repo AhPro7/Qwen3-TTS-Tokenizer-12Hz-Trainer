@@ -28,106 +28,128 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Finite Scalar Quantization (FSQ)
+# Vector Quantization layer (rock-solid EMA codebook update)
 # ---------------------------------------------------------------------------
 
-class FSQ(nn.Module):
-    """Finite Scalar Quantization for massive single-codebook capacity without collapse."""
-    def __init__(self, levels: list[int] = [8, 8, 8, 8, 8, 8]):
+class VectorQuantize(nn.Module):
+    """Proven EMA-based VQ with Dead-Code Restarts (from stable Run 81)."""
+    def __init__(
+        self,
+        codebook_size: int = 16384,  # Large enough for 1 codebook, small enough to be stable
+        dim: int = 128,
+        commitment_cost: float = 0.25,
+        ema_decay: float = 0.99,
+        restart_threshold: float = 1.0, 
+    ):
         super().__init__()
-        self.register_buffer("levels", torch.tensor(levels, dtype=torch.float32))
-        basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0)
-        self.register_buffer("basis", basis.float())
-        self.dim = len(levels)
-        self.codebook_size = int(torch.prod(torch.tensor(levels)).item())
+        self.codebook_size = codebook_size
+        self.dim = dim
+        self.commitment_cost = commitment_cost
+        self.ema_decay = ema_decay
+        self.restart_threshold = restart_threshold
+
+        self.register_buffer("codebook", torch.randn(codebook_size, dim) * (dim ** -0.5))
+        self.register_buffer("ema_cluster_size", torch.ones(codebook_size))
+        self.register_buffer("ema_dw", self.codebook.clone())
         self.last_indices = None
 
+    @property
+    def weight_dtype(self) -> torch.dtype:
+        return self.codebook.dtype
+
     def forward(self, x: torch.Tensor):
-        # x: [B, T, dim]
-        bounds = (self.levels - 1) / 2
-        
-        # Correct FSQ bounding from the paper: bounds * tanh(x / bounds)
-        # This prevents the gradient from vanishing too early compared to tanh(x) * bounds
-        x_bounded = bounds * torch.tanh(x / bounds)
-        
-        quantized = torch.round(x_bounded)
-        # Straight-through estimator
-        quantized_st = x_bounded + (quantized - x_bounded).detach()
-        
-        # Calculate single discrete index per timestep
-        indices = torch.sum((quantized + bounds) * self.basis, dim=-1).long()
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)
+
+        distances = torch.cdist(x_flat.unsqueeze(0), self.codebook.unsqueeze(0)).squeeze(0)
+        indices_flat = distances.argmin(dim=-1)
+        quantized_flat = self.codebook[indices_flat]
+
+        if self.training:
+            with torch.no_grad():
+                one_hot = F.one_hot(indices_flat, self.codebook_size).float()
+                new_cluster_size = one_hot.sum(0)
+                new_dw = one_hot.t() @ x_flat
+
+                self.ema_cluster_size.mul_(self.ema_decay).add_(new_cluster_size * (1 - self.ema_decay))
+                self.ema_dw.mul_(self.ema_decay).add_(new_dw * (1 - self.ema_decay))
+                
+                n = self.ema_cluster_size.sum()
+                smoothed = ((self.ema_cluster_size + 1e-5) / (n + self.codebook_size * 1e-5) * n)
+                self.codebook.copy_(self.ema_dw / smoothed.unsqueeze(1))
+
+                # Dead code restart to prevent collapse
+                if self.restart_threshold > 0:
+                    dead_mask = self.ema_cluster_size < self.restart_threshold
+                    num_dead = dead_mask.sum().item()
+                    if num_dead > 0:
+                        rand_idx = torch.randint(0, x_flat.shape[0], (int(num_dead),), device=x_flat.device)
+                        self.codebook[dead_mask] = x_flat[rand_idx].to(self.codebook.dtype)
+                        self.ema_cluster_size[dead_mask] = self.restart_threshold
+                        self.ema_dw[dead_mask] = x_flat[rand_idx].to(self.ema_dw.dtype)
+
+        commit_loss = self.commitment_cost * F.mse_loss(x_flat, quantized_flat.detach())
+        quantized_st = x_flat + (quantized_flat - x_flat).detach()
+
+        indices = indices_flat.reshape(B, T)
+        quantized = quantized_st.reshape(B, T, D)
         self.last_indices = indices.detach()
-        
-        # Normalize back to [-1, 1] range for the decoder
-        out = quantized_st / bounds
-        
-        return out, indices, x.new_zeros(())
+
+        return quantized, indices, commit_loss
 
     @torch.no_grad()
     def codebook_usage(self) -> float:
-        """FSQ inherently maps continuously, so usage isn't as easily tracked as EMA VQ, but we return a proxy."""
-        if self.last_indices is None:
-            return 0.0
-        unique = self.last_indices.unique().numel()
-        return unique / self.codebook_size
+        if self.last_indices is None: return 0.0
+        return self.last_indices.unique().numel() / self.codebook_size
 
 
 # ---------------------------------------------------------------------------
-# DisentangledProjection (Now heavily optimized as a Single Codebook FSQ Bottleneck)
+# Single Codebook Bottleneck (Zero Speaker)
 # ---------------------------------------------------------------------------
 
 class DisentangledProjection(nn.Module):
-    """
-    Refactored to be a Pure Single-Codebook Bottleneck using FSQ.
-    Speaker logic is bypassed to force the 1 codebook to memorize everything.
-    """
     def __init__(
         self,
         hidden_dim: int = 1024,
         speaker_dim: int = 256,
         content_dim: int = 128,
-        codebook_size: int = 1024,
+        codebook_size: int = 16384,  # 16k is highly stable for 1 codebook EMA
         commitment_cost: float = 0.25,
         ema_decay: float = 0.99,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # FSQ Levels: [8, 8, 8, 8, 8, 8] -> 262,144 unique codes.
-        levels = [8, 8, 8, 8, 8, 8]
-        self.vq = FSQ(levels)
-        
-        # Pre-VQ: compress hidden_dim -> FSQ dim (6)
-        # Replaced ReLU with LayerNorm + SiLU to prevent dead neurons killing the variance
         self.content_pre_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, self.vq.dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, content_dim),
         )
 
-        # Post-VQ: expand FSQ dim (6) -> hidden_dim
+        self.vq = VectorQuantize(
+            codebook_size=codebook_size,
+            dim=content_dim,
+            commitment_cost=commitment_cost,
+            ema_decay=ema_decay,
+        )
+
         self.content_post_proj = nn.Sequential(
-            nn.Linear(self.vq.dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.SiLU(),
+            nn.Linear(content_dim, hidden_dim // 2),
+            nn.ReLU(),
             nn.Linear(hidden_dim // 2, hidden_dim),
         )
 
         self._warm_start_init()
 
     def _warm_start_init(self):
-        """Scale initial projections to fully explore the FSQ grid."""
-        # FSQ requires large enough inputs to escape the center (index 0).
-        # We initialize the pre-projection to have a large variance so it scatters across the levels.
+        """Identity/Zero init so the unfrozen decoder doesn't instantly explode."""
         last_pre = [l for l in self.content_pre_proj if isinstance(l, nn.Linear)][-1]
-        nn.init.normal_(last_pre.weight, std=2.0 / self.hidden_dim**0.5) 
-        # Add uniform bias spread to immediately hit different bins
-        nn.init.uniform_(last_pre.bias, -2.0, 2.0)
+        nn.init.normal_(last_pre.weight, std=(self.vq.dim ** -0.5))
+        nn.init.zeros_(last_pre.bias)
 
-        # Content post_proj last layer: small init so it doesn't explode gradients early
         last_post = [l for l in self.content_post_proj if isinstance(l, nn.Linear)][-1]
-        nn.init.normal_(last_post.weight, std=0.01)
+        # Extremely small init to prevent gradient explosion in the decoder
+        nn.init.normal_(last_post.weight, std=0.001)
         nn.init.zeros_(last_post.bias)
 
     @property
