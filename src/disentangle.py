@@ -240,8 +240,11 @@ class DisentangledProjection(nn.Module):
 
         self._init_weights()
 
-        # Temperature schedule — set externally by trainer
+        # Set externally by trainer each step
         self.temperature: float = 1.0
+        # alpha=0 → pure bypass (x unchanged), alpha=1 → pure VQ bottleneck
+        # Annealed 0→1 over vq_alpha_anneal_steps to force bottleneck to take over
+        self.alpha: float = 0.0
 
     def _init_weights(self):
         """
@@ -281,16 +284,26 @@ class DisentangledProjection(nn.Module):
         Args:
             x: [B, T, hidden_dim]
         Returns:
-            content_emb:    [B, T, hidden_dim]  VQ-quantized hidden (straight-through)
+            content_emb:    [B, T, hidden_dim]  alpha-blended VQ output
             content_indices:[B, T]              discrete token ids
             vq_loss:        scalar              commit + entropy losses
+
+        Alpha schedule (set by trainer):
+            alpha=0.0 → output = x            (pure bypass, bottleneck invisible)
+            alpha=0.5 → output = 0.5*x + 0.5*VQ(x)   (half-half)
+            alpha=1.0 → output = VQ(x)        (pure bottleneck, no bypass)
+
+        This forces the bottleneck to gradually take over the representation
+        instead of staying as a near-zero residual forever.
         """
         x = self._cast(x)
         normed = self.pre_norm(x)
         pre = self.content_pre_proj(normed)              # [B, T, content_dim]
         quantized, indices, vq_loss = self.vq(pre, temperature=self.temperature)
-        content_emb = self.content_post_proj(quantized)  # [B, T, hidden_dim]
-        # Residual connection: bottleneck adds delta to original hidden
-        # This prevents representation collapse during early training
-        content_emb = x + content_emb
+        vq_out = self.content_post_proj(quantized)       # [B, T, hidden_dim]
+
+        # Alpha blend: fade out the bypass (x), but keep vq_out unscaled
+        # so the bottleneck gets full gradients from step 0.
+        fade_factor = 1.0 - self.alpha
+        content_emb = (fade_factor * x) + vq_out
         return content_emb, indices, vq_loss

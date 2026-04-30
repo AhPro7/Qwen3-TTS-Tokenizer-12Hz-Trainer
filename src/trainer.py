@@ -123,6 +123,22 @@ def get_vq_temperature(step: int, anneal_steps: int, t_start: float, t_end: floa
     return t_end + (t_start - t_end) * cosine
 
 
+def get_vq_alpha(step: int, anneal_steps: int) -> float:
+    """
+    Cosine annealing of VQ bottleneck alpha: 0 (bypass) → 1 (full VQ).
+    - Steps 0..anneal_steps/4:  alpha stays near 0 (codebook warm-up phase)
+    - Steps anneal_steps/4..anneal_steps: cosine ramp 0→1
+    - After anneal_steps: alpha=1 (pure bottleneck)
+    """
+    if anneal_steps <= 0 or step >= anneal_steps:
+        return 1.0
+    warmup = anneal_steps // 4
+    if step < warmup:
+        return 0.0
+    ratio = (step - warmup) / max(anneal_steps - warmup, 1)
+    return 0.5 * (1.0 - math.cos(math.pi * ratio))
+
+
 def get_adv_weight(step: int, adv_warmup_steps: int, lambda_adv: float) -> float:
     """Linear ramp of adversarial loss weight from 0 to lambda_adv."""
     if adv_warmup_steps <= 0 or step >= adv_warmup_steps:
@@ -191,6 +207,9 @@ def parse_args():
                         help="VQ temperature after annealing completes.")
     parser.add_argument("--vq_temp_anneal_steps", type=int, default=3000,
                         help="Number of steps over which VQ temperature anneals.")
+    parser.add_argument("--vq_alpha_anneal_steps", type=int, default=5000,
+                        help="Steps over which VQ alpha anneals 0→1 (bottleneck takeover)."
+                             " Should be >= vq_temp_anneal_steps.")
 
     # Discriminator / adversarial warmup
     parser.add_argument("--disc_warmup_steps", type=int, default=500,
@@ -277,6 +296,9 @@ class DecoderTrainingWrapper(nn.Module):
 
     def set_vq_temperature(self, temperature: float):
         self.disentangle.temperature = temperature
+
+    def set_vq_alpha(self, alpha: float):
+        self.disentangle.alpha = alpha
 
     def _run_bottleneck(self, hidden: torch.Tensor) -> torch.Tensor:
         content_emb, content_indices, vq_loss = self.disentangle(hidden)
@@ -993,14 +1015,16 @@ def main():
             target_audio = batch["audio"].to(accelerator.device)
             audio_lengths = batch["audio_lengths"].to(accelerator.device)
 
-            # ── VQ temperature annealing ──────────────────────────────
+            # ── VQ temperature + alpha annealing ─────────────────────
             vq_temp = get_vq_temperature(
                 global_step,
                 args.vq_temp_anneal_steps,
                 args.vq_temp_start,
                 args.vq_temp_end,
             )
+            vq_alpha = get_vq_alpha(global_step, args.vq_alpha_anneal_steps)
             accelerator.unwrap_model(model).set_vq_temperature(vq_temp)
+            accelerator.unwrap_model(model).set_vq_alpha(vq_alpha)
 
             # ── Forward ──────────────────────────────────────────────
             pred_wav_full = model(codes)
@@ -1150,6 +1174,7 @@ def main():
                         "g/vq_codebook_usage": vq_usage,
                         "g/vq_perplexity": vq_perp,
                         "g/vq_temperature": vq_temp,
+                        "g/vq_alpha": vq_alpha,
                         "g/adv_weight": adv_weight,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr_g": scheduler_g.get_last_lr()[0],
@@ -1182,6 +1207,7 @@ def main():
                         vq=f"{commit_loss.item():.2e}",
                         usage=f"{vq_usage:.2f}",
                         T=f"{vq_temp:.2f}",
+                        α=f"{vq_alpha:.2f}",
                         **({"adv": f"{loss_g_adv.item():.2f}"} if disc_active else {}),
                     )
 
