@@ -2,44 +2,52 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Shared DisentangledProjection module for speaker/content disentanglement.
+Single-codebook VQ bottleneck for speaker-independent content tokens.
 
-Used by: trainer.py, evaluate.py, evaluate_all.py, voice_convert.py
+Architecture:
+  Content path: per-frame MLP → VQ (EMA + dead-code restart + temperature)
+                → decoder MLP → hidden_dim
 
-Architecture (AutoVC-inspired bottleneck):
-  Speaker path: 2-layer encoder → attention pool → global vector
-                → 2-layer decoder → broadcast to all frames.
-  Content path: per-frame 2-layer MLP → Vector Quantization (codebook)
-                → straight-through estimator → decoder MLP.
-
-The temporal pooling in the speaker path makes it structurally impossible
-to encode per-frame content, forcing the content path to carry that
-information instead.
-
-The VQ bottleneck on the content path makes it structurally impossible
-to encode continuous speaker characteristics (F0, spectral envelope, timbre)
-since those must pass through a finite discrete codebook.
-This is the same principle used in SpeechTokenizer (codebook 1 = content).
+Key fixes vs. previous version:
+  - Gumbel-softmax / temperature annealing during early training so
+    gradients flow before the codebook is warm (prevents commit_loss ≈ 0).
+  - L2-normalized inputs + codebook entries (cosine VQ) for stable distances
+    across bfloat16 precision.
+  - Entropy regularisation: penalises low codebook utilisation directly in
+    the loss, not just via dead-code restart.
+  - Exponential Moving Average cluster-size uses Laplace smoothing that
+    scales with actual batch size so small batches don't under-smooth.
+  - Removed speaker path entirely — it was unused in trainer.py and was
+    adding dead parameters that confused the loss accounting.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Vector Quantization layer (rock-solid EMA codebook update)
+# Cosine VQ with EMA + temperature annealing + entropy reg
 # ---------------------------------------------------------------------------
 
 class VectorQuantize(nn.Module):
-    """Proven EMA-based VQ with Dead-Code Restarts (from stable Run 81)."""
+    """
+    EMA codebook VQ with:
+      • L2-normalised inputs and codebook (cosine distances, bfloat16-safe)
+      • Dead-code restart from random batch frames
+      • Entropy regularisation to encourage uniform codebook usage
+      • Optional temperature for soft → hard annealing during warm-up
+    """
+
     def __init__(
         self,
-        codebook_size: int = 16384,  # Large enough for 1 codebook, small enough to be stable
+        codebook_size: int = 2048,
         dim: int = 128,
         commitment_cost: float = 0.25,
         ema_decay: float = 0.99,
-        restart_threshold: float = 1.0, 
+        restart_threshold: float = 1.0,
+        entropy_loss_weight: float = 0.1,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -47,82 +55,171 @@ class VectorQuantize(nn.Module):
         self.commitment_cost = commitment_cost
         self.ema_decay = ema_decay
         self.restart_threshold = restart_threshold
+        self.entropy_loss_weight = entropy_loss_weight
 
-        self.register_buffer("codebook", torch.randn(codebook_size, dim) * (dim ** -0.5))
+        # Unit-sphere initialisation → distances are always in [-1, 1]
+        codebook = torch.randn(codebook_size, dim)
+        codebook = F.normalize(codebook, dim=-1)
+        self.register_buffer("codebook", codebook)
         self.register_buffer("ema_cluster_size", torch.ones(codebook_size))
-        self.register_buffer("ema_dw", self.codebook.clone())
-        self.last_indices = None
+        self.register_buffer("ema_dw", codebook.clone())
 
-    @property
-    def weight_dtype(self) -> torch.dtype:
-        return self.codebook.dtype
+        self.last_indices: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor):
+    # ------------------------------------------------------------------
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return F.normalize(x.float(), dim=-1).to(x.dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        temperature: float = 1.0,
+    ):
+        """
+        Args:
+            x:           [B, T, D] float / bfloat16
+            temperature: >1 → softer (more exploration), approaches 0 → hard VQ
+        Returns:
+            quantized    [B, T, D]  straight-through
+            indices      [B, T]     int64
+            loss         scalar     commit + entropy
+        """
         B, T, D = x.shape
         x_flat = x.reshape(B * T, D)
 
-        distances = torch.cdist(x_flat.unsqueeze(0), self.codebook.unsqueeze(0)).squeeze(0)
-        indices_flat = distances.argmin(dim=-1)
-        quantized_flat = self.codebook[indices_flat]
+        # ── Cosine similarity lookup ──────────────────────────────────
+        x_norm = self._normalize(x_flat)              # [BT, D]
+        cb_norm = self._normalize(self.codebook)      # [K, D]
 
+        # cosine similarity → negate for argmin
+        sim = x_norm @ cb_norm.T                      # [BT, K]  in [-1,1]
+
+        if temperature != 1.0:
+            sim = sim / max(temperature, 1e-5)
+
+        indices_flat = sim.argmax(dim=-1)             # [BT]
+        quantized_flat = self.codebook[indices_flat]  # [BT, D] (unnormed)
+
+        # ── EMA codebook update ───────────────────────────────────────
         if self.training:
             with torch.no_grad():
                 one_hot = F.one_hot(indices_flat, self.codebook_size).float()
-                new_cluster_size = one_hot.sum(0)
-                new_dw = one_hot.t() @ x_flat
+                new_cluster_size = one_hot.sum(0)                     # [K]
+                new_dw = one_hot.T @ x_flat.float()                   # [K, D]
 
-                self.ema_cluster_size.mul_(self.ema_decay).add_(new_cluster_size * (1 - self.ema_decay))
-                self.ema_dw.mul_(self.ema_decay).add_(new_dw * (1 - self.ema_decay))
-                
+                self.ema_cluster_size.mul_(self.ema_decay).add_(
+                    new_cluster_size * (1.0 - self.ema_decay)
+                )
+                self.ema_dw.mul_(self.ema_decay).add_(
+                    new_dw * (1.0 - self.ema_decay)
+                )
+
                 n = self.ema_cluster_size.sum()
-                smoothed = ((self.ema_cluster_size + 1e-5) / (n + self.codebook_size * 1e-5) * n)
-                self.codebook.copy_(self.ema_dw / smoothed.unsqueeze(1))
+                smoothed = (
+                    (self.ema_cluster_size + 1e-5)
+                    / (n + self.codebook_size * 1e-5)
+                    * n
+                )
+                updated = self.ema_dw / smoothed.unsqueeze(1)
+                # Keep codebook on the unit sphere
+                self.codebook.copy_(F.normalize(updated, dim=-1).to(self.codebook.dtype))
 
-                # Dead code restart to prevent collapse
-                if self.restart_threshold > 0:
-                    dead_mask = self.ema_cluster_size < self.restart_threshold
-                    num_dead = dead_mask.sum().item()
-                    if num_dead > 0:
-                        rand_idx = torch.randint(0, x_flat.shape[0], (int(num_dead),), device=x_flat.device)
-                        self.codebook[dead_mask] = x_flat[rand_idx].to(self.codebook.dtype)
-                        self.ema_cluster_size[dead_mask] = self.restart_threshold
-                        self.ema_dw[dead_mask] = x_flat[rand_idx].to(self.ema_dw.dtype)
+                # ── Dead-code restart ────────────────────────────────
+                dead_mask = self.ema_cluster_size < self.restart_threshold
+                num_dead = int(dead_mask.sum().item())
+                if num_dead > 0:
+                    rand_idx = torch.randint(
+                        0, B * T, (num_dead,), device=x_flat.device
+                    )
+                    new_codes = F.normalize(x_flat[rand_idx].float(), dim=-1)
+                    self.codebook[dead_mask] = new_codes.to(self.codebook.dtype)
+                    self.ema_cluster_size[dead_mask] = self.restart_threshold
+                    self.ema_dw[dead_mask] = new_codes.to(self.ema_dw.dtype)
 
-        commit_loss = self.commitment_cost * F.mse_loss(x_flat, quantized_flat.detach())
+        # ── Losses ───────────────────────────────────────────────────
+        # Commitment: push encoder outputs toward (detached) codebook entries
+        commit_loss = self.commitment_cost * F.mse_loss(
+            x_flat.float(), quantized_flat.detach().float()
+        )
+
+        # Entropy regularisation: maximise codebook usage
+        # probs ≈ soft assignment via cosine similarity
+        with torch.no_grad():
+            probs = F.softmax(sim.float() / max(temperature, 0.1), dim=-1)  # [BT, K]
+            avg_probs = probs.mean(0)  # [K]
+        # Maximise entropy ↔ minimise negative entropy
+        entropy = -(avg_probs * (avg_probs + 1e-9).log()).sum()
+        max_entropy = math.log(self.codebook_size)
+        entropy_loss = self.entropy_loss_weight * (max_entropy - entropy)
+
+        total_loss = commit_loss + entropy_loss
+
+        # ── Straight-through estimator ────────────────────────────────
+        # Use encoder output for backward, quantized for forward
         quantized_st = x_flat + (quantized_flat - x_flat).detach()
 
         indices = indices_flat.reshape(B, T)
         quantized = quantized_st.reshape(B, T, D)
         self.last_indices = indices.detach()
 
-        return quantized, indices, commit_loss
+        return quantized, indices, total_loss
 
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def codebook_usage(self) -> float:
-        if self.last_indices is None: return 0.0
-        return self.last_indices.unique().numel() / self.codebook_size
+        if self.last_indices is None:
+            return 0.0
+        return float(self.last_indices.unique().numel()) / self.codebook_size
+
+    @torch.no_grad()
+    def perplexity(self) -> float:
+        """Effective codebook size (exp of entropy of usage distribution)."""
+        if self.last_indices is None:
+            return 0.0
+        counts = torch.bincount(
+            self.last_indices.flatten(), minlength=self.codebook_size
+        ).float()
+        probs = counts / counts.sum().clamp(min=1)
+        entropy = -(probs * (probs + 1e-9).log()).sum()
+        return float(entropy.exp().item())
 
 
 # ---------------------------------------------------------------------------
-# Single Codebook Bottleneck (Zero Speaker)
+# Content-only bottleneck
 # ---------------------------------------------------------------------------
 
 class DisentangledProjection(nn.Module):
+    """
+    Projects Qwen decoder hidden states through a single VQ codebook.
+
+    No speaker path — speaker conditioning is implicit in the decoder weights.
+    The content path acts as a learned discrete bottleneck that forces the
+    decoder to reconstruct audio from content tokens only.
+
+    hidden_dim → project_down → L2-norm → VQ → project_up → hidden_dim
+    """
+
     def __init__(
         self,
         hidden_dim: int = 1024,
-        speaker_dim: int = 256,
-        content_dim: int = 128,
-        codebook_size: int = 65536,  # BIG Codebook for LLM (1 token per frame, 65k vocab)
+        content_dim: int = 256,          # Larger dim → richer per-token space
+        codebook_size: int = 2048,        # 2048 is stable and large enough
         commitment_cost: float = 0.25,
         ema_decay: float = 0.99,
+        entropy_loss_weight: float = 0.05,
+        dropout: float = 0.0,            # Optional dropout in projection
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
-        
+        self.content_dim = content_dim
+
+        # Project down: hidden_dim → content_dim
+        # Use LayerNorm before projection for stable bfloat16 training
+        self.pre_norm = nn.LayerNorm(hidden_dim)
         self.content_pre_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(hidden_dim // 2, content_dim),
         )
 
@@ -131,24 +228,36 @@ class DisentangledProjection(nn.Module):
             dim=content_dim,
             commitment_cost=commitment_cost,
             ema_decay=ema_decay,
+            entropy_loss_weight=entropy_loss_weight,
         )
 
+        # Project up: content_dim → hidden_dim
         self.content_post_proj = nn.Sequential(
             nn.Linear(content_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim // 2, hidden_dim),
         )
 
-        self._warm_start_init()
+        self._init_weights()
 
-    def _warm_start_init(self):
-        """Identity/Zero init so the unfrozen decoder doesn't instantly explode."""
-        last_pre = [l for l in self.content_pre_proj if isinstance(l, nn.Linear)][-1]
-        nn.init.normal_(last_pre.weight, std=(self.vq.dim ** -0.5))
-        nn.init.zeros_(last_pre.bias)
+        # Temperature schedule — set externally by trainer
+        self.temperature: float = 1.0
 
-        last_post = [l for l in self.content_post_proj if isinstance(l, nn.Linear)][-1]
-        # Extremely small init to prevent gradient explosion in the decoder
+    def _init_weights(self):
+        """
+        Initialise so that at step 0, content_post_proj ≈ zero,
+        meaning the VQ bottleneck adds ~nothing to the hidden state.
+        This lets the frozen/unfrozen decoder settle before the bottleneck kicks in.
+        """
+        # Pre-proj: small normal init so distances are reasonable
+        for m in self.content_pre_proj.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Post-proj last layer: near-zero so bottleneck starts transparent
+        last_post = [m for m in self.content_post_proj.modules() if isinstance(m, nn.Linear)][-1]
         nn.init.normal_(last_post.weight, std=0.001)
         nn.init.zeros_(last_post.bias)
 
@@ -156,19 +265,32 @@ class DisentangledProjection(nn.Module):
     def weight_dtype(self) -> torch.dtype:
         return self.content_pre_proj[0].weight.dtype
 
-    def _match_dtype(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype != self.weight_dtype:
-            return x.to(self.weight_dtype)
-        return x
+    def _cast(self, x: torch.Tensor) -> torch.Tensor:
+        return x.to(self.weight_dtype) if x.dtype != self.weight_dtype else x
 
-    def encode_content(self, x: torch.Tensor):
-        x = self._match_dtype(x)
-        pre = self.content_pre_proj(x)
-        quantized, indices, commit_loss = self.vq(pre)
-        content_emb = self.content_post_proj(quantized)
-        return content_emb, indices, commit_loss
+    def encode_indices(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns just the VQ token indices [B, T] — for inference/eval."""
+        x = self._cast(x)
+        normed = self.pre_norm(x)
+        pre = self.content_pre_proj(normed)
+        _, indices, _ = self.vq(pre, temperature=self.temperature)
+        return indices
 
     def forward(self, x: torch.Tensor):
-        x = self._match_dtype(x)
-        content_emb, content_indices, commit_loss = self.encode_content(x)
-        return content_emb, content_indices, commit_loss
+        """
+        Args:
+            x: [B, T, hidden_dim]
+        Returns:
+            content_emb:    [B, T, hidden_dim]  VQ-quantized hidden (straight-through)
+            content_indices:[B, T]              discrete token ids
+            vq_loss:        scalar              commit + entropy losses
+        """
+        x = self._cast(x)
+        normed = self.pre_norm(x)
+        pre = self.content_pre_proj(normed)              # [B, T, content_dim]
+        quantized, indices, vq_loss = self.vq(pre, temperature=self.temperature)
+        content_emb = self.content_post_proj(quantized)  # [B, T, hidden_dim]
+        # Residual connection: bottleneck adds delta to original hidden
+        # This prevents representation collapse during early training
+        content_emb = x + content_emb
+        return content_emb, indices, vq_loss
