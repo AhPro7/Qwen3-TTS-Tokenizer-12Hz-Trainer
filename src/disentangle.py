@@ -113,7 +113,7 @@ class DisentangledProjection(nn.Module):
         hidden_dim: int = 1024,
         speaker_dim: int = 256,
         content_dim: int = 128,
-        codebook_size: int = 16384,  # 16k is highly stable for 1 codebook EMA
+        codebook_size: int = 65536,  # BIG Codebook for LLM (1 token per frame, 65k vocab)
         commitment_cost: float = 0.25,
         ema_decay: float = 0.99,
     ):
