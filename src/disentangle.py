@@ -302,8 +302,6 @@ class DisentangledProjection(nn.Module):
         quantized, indices, vq_loss = self.vq(pre, temperature=self.temperature)
         vq_out = self.content_post_proj(quantized)       # [B, T, hidden_dim]
 
-        # Alpha blend: fade out the bypass (x), but keep vq_out unscaled
-        # so the bottleneck gets full gradients from step 0.
-        fade_factor = 1.0 - self.alpha
-        content_emb = (fade_factor * x) + vq_out
+        # Alpha blend: lerp from bypass (x) to pure VQ (vq_out)
+        content_emb = (1.0 - self.alpha) * x + self.alpha * vq_out
         return content_emb, indices, vq_loss
