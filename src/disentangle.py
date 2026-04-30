@@ -110,8 +110,21 @@ class DisentangledProjection(nn.Module):
             nn.Linear(hidden_dim // 2, hidden_dim),
         )
 
-        # Dummy parameters to satisfy optimizer/trainer constraints natively
-        self.speaker_attention = nn.Linear(hidden_dim, 1)
+        self._warm_start_init()
+
+    def _warm_start_init(self):
+        """Scale initial projections to fully explore the FSQ grid."""
+        # FSQ requires large enough inputs to escape the center (index 0).
+        # We initialize the pre-projection to have a large variance so it scatters across the levels.
+        last_pre = [l for l in self.content_pre_proj if isinstance(l, nn.Linear)][-1]
+        nn.init.normal_(last_pre.weight, std=2.0 / self.hidden_dim**0.5) 
+        # Add uniform bias spread to immediately hit different bins
+        nn.init.uniform_(last_pre.bias, -2.0, 2.0)
+
+        # Content post_proj last layer: small init so it doesn't explode gradients early
+        last_post = [l for l in self.content_post_proj if isinstance(l, nn.Linear)][-1]
+        nn.init.normal_(last_post.weight, std=0.01)
+        nn.init.zeros_(last_post.bias)
 
     @property
     def weight_dtype(self) -> torch.dtype:
@@ -122,18 +135,6 @@ class DisentangledProjection(nn.Module):
             return x.to(self.weight_dtype)
         return x
 
-    def encode_speaker(self, x: torch.Tensor) -> torch.Tensor:
-        """Bypassed: Returns dummy zeroes tied to the graph to prevent optimizer crashes."""
-        x = self._match_dtype(x)
-        dummy = (x * 0).sum(dim=1) # [B, H]
-        return dummy[:, :256] # Fake speaker_dim
-
-    def decode_speaker(self, speaker_global: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Bypassed: Returns dummy zeroes."""
-        speaker_global = self._match_dtype(speaker_global)
-        b = speaker_global.shape[0]
-        return torch.zeros((b, seq_len, self.hidden_dim), device=speaker_global.device, dtype=speaker_global.dtype)
-
     def encode_content(self, x: torch.Tensor):
         x = self._match_dtype(x)
         pre = self.content_pre_proj(x)
@@ -143,11 +144,5 @@ class DisentangledProjection(nn.Module):
 
     def forward(self, x: torch.Tensor):
         x = self._match_dtype(x)
-        
         content_emb, content_indices, commit_loss = self.encode_content(x)
-        
-        # Speaker bypassed: we force the single FSQ codebook to hold all audio information
-        speaker_global = self.encode_speaker(x)
-        speaker_contribution = self.decode_speaker(speaker_global, x.shape[1])
-
-        return speaker_contribution, content_emb, speaker_global, content_indices, commit_loss
+        return content_emb, content_indices, commit_loss

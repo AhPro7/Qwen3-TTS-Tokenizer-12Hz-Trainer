@@ -499,27 +499,20 @@ class DecoderTrainingWrapper(nn.Module):
 
         # Stored after each forward pass — read by the training loop
         self.last_content_emb = None
-        self.last_speaker_emb = None      # [B, T, hidden_dim] contribution
-        self.last_speaker_global = None   # [B, speaker_dim] for logging / swap
         self.last_original_hidden = None  # [B, T, hidden_dim] pre-disentangle
         self.last_content_indices = None  # [B, T] discrete VQ token indices
         self.last_commit_loss = None      # scalar VQ commitment loss
 
     def _run_disentangle(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Run DisentangledProjection, store results, return combined hidden."""
-        # disentangle returns (speaker_contrib, content_emb, speaker_global,
-        #                      content_indices, commit_loss)
-        speaker_contrib, content_emb, speaker_global, content_indices, commit_loss = \
-            self.disentangle(hidden)
+        """Run single codebook bottleneck, store results, return new hidden."""
+        content_emb, content_indices, commit_loss = self.disentangle(hidden)
 
-        self.last_speaker_emb = speaker_contrib
         self.last_content_emb = content_emb
-        self.last_speaker_global = speaker_global
         self.last_original_hidden = hidden.detach()
         self.last_content_indices = content_indices
         self.last_commit_loss = commit_loss
 
-        return speaker_contrib + content_emb
+        return content_emb
 
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         if codes.shape[1] != self.decoder.config.num_quantizers:
@@ -1417,23 +1410,12 @@ def main():
                 else:
                     loss_global_rms = pred.new_zeros(())
 
-                # ─── Disentanglement losses ───────────────────────────────
+                # ─── Bottleneck losses ────────────────────────────────────────
                 unwrapped_model = accelerator.unwrap_model(model)
-                speaker_emb = unwrapped_model.last_speaker_emb
                 content_emb = unwrapped_model.last_content_emb
-                speaker_global = unwrapped_model.last_speaker_global
                 original_hidden = unwrapped_model.last_original_hidden
                 # VQ losses (from discrete content codebook)
                 commit_loss = unwrapped_model.last_commit_loss
-
-                # Linear warmup ramp for disentanglement losses
-                if args.disentangle_warmup_steps > 0:
-                    dis_ramp = min(1.0, global_step / args.disentangle_warmup_steps)
-                else:
-                    dis_ramp = 1.0
-
-                # Orthogonality: speaker ⊥ content (Disabled: single codebook mode)
-                loss_ortho = content_emb.new_zeros(())
 
                 # Content consistency: MSE(content_emb, original_hidden)
                 if args.lambda_consistency > 0:
@@ -1443,22 +1425,13 @@ def main():
                 else:
                     loss_consistency = content_emb.new_zeros(())
 
-                # Speaker identity preservation (Disabled: single codebook mode)
-                loss_speaker_id = content_emb.new_zeros(())
-
-                # In-batch speaker swap cycle consistency (Disabled: single codebook mode)
-                loss_cycle = content_emb.new_zeros(())
-
                 # Total generator loss (commit_loss is VQ bottleneck loss)
                 loss_g = (
                     args.lambda_adv * loss_g_adv
                     + args.lambda_fm * loss_fm
                     + args.lambda_multi_res_mel * loss_multi_res_mel
                     + args.lambda_global_rms * loss_global_rms
-                    + dis_ramp * args.lambda_orth * loss_ortho
                     + args.lambda_consistency * loss_consistency
-                    + dis_ramp * args.lambda_speaker_id * loss_speaker_id
-                    + dis_ramp * args.lambda_cycle * loss_cycle
                     + commit_loss  # VQ commitment loss (no extra lambda, built-in weight)
                 )
 
@@ -1543,13 +1516,9 @@ def main():
                         "g/loss_total": loss_g.item(),
                         "g/loss_multi_res_mel": loss_multi_res_mel.item(),
                         "g/loss_global_rms": loss_global_rms.item(),
-                        "g/loss_ortho": loss_ortho.item(),
                         "g/loss_consistency": loss_consistency.item(),
-                        "g/loss_speaker_id": loss_speaker_id.item(),
-                        "g/loss_cycle": loss_cycle.item(),
                         "g/vq_commit_loss": commit_loss.item(),
                         "g/vq_codebook_usage": unwrapped_model.disentangle.vq.codebook_usage(),
-                        "g/dis_ramp": dis_ramp,
                         "g/grad_norm": gen_grad_norm,
                         "train/lr/generator": scheduler_g.get_last_lr()[0],
                         "train/audio_sec": audio_sec,
@@ -1654,11 +1623,8 @@ def main():
                                 vc_pairs.append(vc_pairs[0])
 
                             vc_table = wandb.Table(columns=[
-                                "Original Speaker Audio",
-                                "Original Speaker Reconstruction",
-                                "Target Speaker Audio",
-                                "Target Speaker Reconstruction",
-                                "Converted Output",
+                                "Original Audio",
+                                "Reconstructed Audio",
                             ])
 
                             with torch.inference_mode(), accelerator.autocast():
@@ -1670,42 +1636,24 @@ def main():
                                 for idx in unique_indices:
                                     h = _to_hidden(sample_codes[idx:idx+1])
                                     hidden_cache[idx] = h
-                                    # disentangle returns 5 values — unpack all
-                                    spk_c, cnt_c, _, _, _ = dis(h)
-                                    recon_hidden = spk_c + cnt_c
+                                    # FSQ bottleneck
+                                    cnt_c, _, _ = dis(h)
+                                    recon_hidden = cnt_c
                                     recon_cache[idx] = _decode_hidden(recon_hidden)
 
-                                for src_i, tgt_i in vc_pairs[:3]:
+                                for src_i in unique_indices[:3]: # Just log up to 3 reconstructions
                                     try:
                                         src_gt_np = sample_targets[src_i].numpy()
-                                        tgt_gt_np = sample_targets[tgt_i].numpy()
                                         src_recon_np = recon_cache[src_i]
-                                        tgt_recon_np = recon_cache[tgt_i]
-
-                                        # Voice conversion:
-                                        # encode_content returns (content_emb, indices, commit_loss)
-                                        content_src, _, _ = dis.encode_content(hidden_cache[src_i])
-                                        speaker_tgt = dis.encode_speaker(hidden_cache[tgt_i])
-                                        speaker_tgt_contrib = dis.decode_speaker(
-                                            speaker_tgt, content_src.shape[1]
-                                        )
-                                        combined = speaker_tgt_contrib + content_src
-                                        vc_np = _decode_hidden(combined)
 
                                         vc_table.add_data(
                                             wandb.Audio(src_gt_np, sample_rate=sample_sr,
                                                         caption=f"Original #{src_i}"),
                                             wandb.Audio(src_recon_np, sample_rate=sample_sr,
                                                         caption=f"Recon #{src_i}"),
-                                            wandb.Audio(tgt_gt_np, sample_rate=sample_sr,
-                                                        caption=f"Target #{tgt_i}"),
-                                            wandb.Audio(tgt_recon_np, sample_rate=sample_sr,
-                                                        caption=f"Recon #{tgt_i}"),
-                                            wandb.Audio(vc_np, sample_rate=sample_sr,
-                                                        caption=f"VC: content[{src_i}]+speaker[{tgt_i}]"),
                                         )
                                     except Exception as row_e:
-                                        accelerator.print(f"VC table row failed: {row_e}")
+                                        accelerator.print(f"Table row failed: {row_e}")
 
                             log_media = {"voice_conversion_table": vc_table}
                             for i in range(min(2, B)):
