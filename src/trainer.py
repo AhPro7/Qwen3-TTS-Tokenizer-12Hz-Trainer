@@ -641,6 +641,143 @@ def save_checkpoint(
 
 
 # =============================================================================
+# W&B audio sample logging
+# =============================================================================
+
+@torch.no_grad()
+def _log_audio_samples(
+    model: nn.Module,
+    val_dataloader: DataLoader,
+    accelerator: Accelerator,
+    sample_rate: int,
+    global_step: int,
+    num_samples: int = 4,
+):
+    """
+    Logs a W&B Table with columns:
+        Original | Reconstructed (VQ bottleneck) | Bypass (no bottleneck)
+
+    'Bypass' runs the full decoder WITHOUT the VQ bottleneck so you can
+    hear how much the bottleneck degrades / changes the output.
+    """
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    model.eval()
+    unwrapped: DecoderTrainingWrapper = accelerator.unwrap_model(model)
+    dec = unwrapped.decoder
+    dis = unwrapped.disentangle
+
+    # ── Grab one batch from val ────────────────────────────────────────
+    batch = next(iter(val_dataloader))
+    codes   = batch["audio_codes"].to(accelerator.device).transpose(1, 2)  # [B, Q, T]
+    targets = batch["audio"].float().cpu()                                  # [B, L]
+    B = min(codes.shape[0], num_samples)
+
+    # ── Helper: transformer encoder → hidden ──────────────────────────
+    def _to_hidden(c: torch.Tensor) -> torch.Tensor:
+        """c: [1, Q, T] → hidden: [1, T, D]"""
+        h = dec.quantizer.decode(c)
+        h = dec.pre_conv(h).transpose(1, 2)
+        return dec.pre_transformer(inputs_embeds=h).last_hidden_state
+
+    # ── Helper: hidden → waveform ─────────────────────────────────────
+    def _hidden_to_wav(hidden: torch.Tensor) -> "list[float]":
+        """hidden: [1, T, D] → numpy float32 mono waveform"""
+        x = hidden.permute(0, 2, 1)
+        for blocks in dec.upsample:
+            for block in blocks:
+                x = block(x)
+        wav = x
+        for block in dec.decoder:
+            wav = block(wav)
+        return wav.clamp(-1, 1).squeeze().float().cpu().numpy()
+
+    table = wandb.Table(columns=[
+        "step",
+        "sample_id",
+        "original",
+        "reconstructed_vq",
+        "bypass_no_vq",
+        "vq_token_ids",
+        "codebook_usage_pct",
+    ])
+
+    with torch.inference_mode(), accelerator.autocast():
+        for i in range(B):
+            try:
+                c_i = codes[i : i + 1]            # [1, Q, T]
+
+                # ── Encoder hidden ────────────────────────────────────
+                hidden = _to_hidden(c_i)           # [1, T, D]
+
+                # ── VQ bottleneck ─────────────────────────────────────
+                content_emb, indices, _ = dis(hidden)
+                recon_wav = _hidden_to_wav(content_emb)
+
+                # ── Bypass (identity — no bottleneck) ─────────────────
+                bypass_wav = _hidden_to_wav(hidden)
+
+                # ── Original target ───────────────────────────────────
+                orig_np = targets[i].numpy()
+                # Trim/pad to same length as recon for fair comparison
+                min_len = min(len(orig_np), len(recon_wav), len(bypass_wav))
+                orig_np   = orig_np[:min_len]
+                recon_wav = recon_wav[:min_len]
+                bypass_wav = bypass_wav[:min_len]
+
+                # ── VQ token summary ──────────────────────────────────
+                token_ids = indices[0].cpu().tolist()          # [T]
+                n_unique  = len(set(token_ids))
+                usage_pct = round(100.0 * n_unique / dis.vq.codebook_size, 2)
+                token_str = str(token_ids[:20]) + ("..." if len(token_ids) > 20 else "")
+
+                table.add_data(
+                    global_step,
+                    i,
+                    wandb.Audio(orig_np,   sample_rate=sample_rate, caption=f"Original #{i}"),
+                    wandb.Audio(recon_wav, sample_rate=sample_rate, caption=f"VQ Recon #{i}"),
+                    wandb.Audio(bypass_wav, sample_rate=sample_rate, caption=f"Bypass #{i}"),
+                    token_str,
+                    usage_pct,
+                )
+
+            except Exception as row_err:
+                accelerator.print(f"Audio table row {i} failed: {row_err}")
+
+    # Also log individual audio clips directly (easier to find in W&B UI)
+    direct_log = {"val/audio_table": table}
+    with torch.inference_mode(), accelerator.autocast():
+        for i in range(min(B, 2)):
+            try:
+                c_i    = codes[i : i + 1]
+                hidden = _to_hidden(c_i)
+                content_emb, _, _ = dis(hidden)
+                recon_wav  = _hidden_to_wav(content_emb)
+                bypass_wav = _hidden_to_wav(hidden)
+                orig_np    = targets[i].numpy()
+                min_len = min(len(orig_np), len(recon_wav), len(bypass_wav))
+
+                direct_log[f"val/original_{i}"]   = wandb.Audio(
+                    orig_np[:min_len], sample_rate=sample_rate)
+                direct_log[f"val/recon_vq_{i}"]   = wandb.Audio(
+                    recon_wav[:min_len], sample_rate=sample_rate)
+                direct_log[f"val/bypass_{i}"]     = wandb.Audio(
+                    bypass_wav[:min_len], sample_rate=sample_rate)
+            except Exception as e:
+                accelerator.print(f"Direct audio log {i} failed: {e}")
+
+    try:
+        wandb.log(direct_log, step=global_step)
+    except Exception as e:
+        accelerator.print(f"W&B audio log failed: {e}")
+
+    model.train()
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -1057,6 +1194,17 @@ def main():
                     )
                     accelerator.print(f"\nStep {global_step} - Validation: {val_metrics}")
                     accelerator.log(val_metrics, step=global_step)
+
+                    # ── W&B audio samples ──────────────────────────────
+                    if accelerator.is_main_process and args.log_with == "wandb":
+                        _log_audio_samples(
+                            model=model,
+                            val_dataloader=val_dataloader,
+                            accelerator=accelerator,
+                            sample_rate=target_sample_rate,
+                            global_step=global_step,
+                            num_samples=4,
+                        )
 
                     if val_metrics["val/loss_multi_res_mel"] < best_val_loss:
                         best_val_loss = val_metrics["val/loss_multi_res_mel"]
