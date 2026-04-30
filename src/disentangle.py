@@ -302,6 +302,15 @@ class DisentangledProjection(nn.Module):
         quantized, indices, vq_loss = self.vq(pre, temperature=self.temperature)
         vq_out = self.content_post_proj(quantized)       # [B, T, hidden_dim]
 
-        # Alpha blend: lerp from bypass (x) to pure VQ (vq_out)
+        # Force the VQ bottleneck to approximate the continuous hidden state.
+        # This guarantees the codebook learns a discrete representation of x from
+        # Step 0, even when alpha is 0 and Mel gradients are blocked.
+        consistency_loss = F.mse_loss(vq_out, x.detach())
+        total_vq_loss = vq_loss + consistency_loss
+
+        # Strict alpha blend. 
+        # alpha=0: pure bypass (decoder is stable, encoder learns via Mel loss)
+        # alpha=1: pure VQ (100% discrete LLM bottleneck)
         content_emb = (1.0 - self.alpha) * x + self.alpha * vq_out
-        return content_emb, indices, vq_loss
+        
+        return content_emb, indices, total_vq_loss
