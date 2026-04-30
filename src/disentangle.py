@@ -45,8 +45,10 @@ class FSQ(nn.Module):
     def forward(self, x: torch.Tensor):
         # x: [B, T, dim]
         bounds = (self.levels - 1) / 2
-        # Bound x using tanh to ensure it stays in valid FSQ range
-        x_bounded = torch.tanh(x) * bounds
+        
+        # Correct FSQ bounding from the paper: bounds * tanh(x / bounds)
+        # This prevents the gradient from vanishing too early compared to tanh(x) * bounds
+        x_bounded = bounds * torch.tanh(x / bounds)
         
         quantized = torch.round(x_bounded)
         # Straight-through estimator
@@ -92,21 +94,23 @@ class DisentangledProjection(nn.Module):
         self.hidden_dim = hidden_dim
         
         # FSQ Levels: [8, 8, 8, 8, 8, 8] -> 262,144 unique codes.
-        # This gives a single codebook immense capacity to capture audio accurately.
         levels = [8, 8, 8, 8, 8, 8]
         self.vq = FSQ(levels)
         
         # Pre-VQ: compress hidden_dim -> FSQ dim (6)
+        # Replaced ReLU with LayerNorm + SiLU to prevent dead neurons killing the variance
         self.content_pre_proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
             nn.Linear(hidden_dim // 2, self.vq.dim),
         )
 
         # Post-VQ: expand FSQ dim (6) -> hidden_dim
         self.content_post_proj = nn.Sequential(
             nn.Linear(self.vq.dim, hidden_dim // 2),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.SiLU(),
             nn.Linear(hidden_dim // 2, hidden_dim),
         )
 
